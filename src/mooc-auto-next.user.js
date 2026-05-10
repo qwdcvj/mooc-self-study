@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.2.6
-// @description  Save real learning progress, help read documents aloud, take notes, and go next only after a video naturally ends.
+// @version      0.2.7
+// @description  Save real learning progress, turn document pages, and stay inside courseware when moving to the next item.
 // @author       qwdcvj
 // @match        *://icourse163.org/*
 // @match        *://*.icourse163.org/*
@@ -22,13 +22,15 @@
   const CONFIG = {
     clickDelayMs: 1200,
     scanIntervalMs: 3000,
-    readingIntervalMs: 10000,
+    readingIntervalMs: 1000,
     mutationDebounceMs: 800,
     scrollDebounceMs: 500,
     saveVideoEveryMs: 5000,
     restoreSafeGapSeconds: 15,
     readingCompletePercent: 95,
     readingDwellSeconds: 30,
+    documentPageDwellSeconds: 5,
+    coursewareMenuOpenDelayMs: 500,
     maxSpeechChars: 12000,
     debug: false,
     nextTextPatterns: [
@@ -63,6 +65,13 @@
       /^课件$/,
       /讨论|讨论区|问答|答疑|评论|论坛|公告|通知|消息|分享|评价课程|评分|老师提问|提问|客服|帮助/,
       /discuss|forum|comment|notice|message|share|rating|review|question|support|help/i
+    ],
+    coursewareContentPatterns: [
+      /^\s*\d+(?:\.\d+)+(?:\s|[：:、.．(（]).{1,100}/,
+      /^\s*第[一二三四五六七八九十百千万\d]+[章节课讲]\s*.{1,100}/
+    ],
+    coursewareMenuPatterns: [
+      /select|dropdown|menu|chapter|lesson|section|course|unit|j-|u-/i
     ],
     titleSelectors: [
       'h1',
@@ -265,6 +274,262 @@
 
   function getClassAndId(element) {
     return `${element.id || ''} ${element.className || ''}`;
+  }
+
+  function getClassAndIdChain(element, maxDepth = 3) {
+    const parts = [];
+    let current = element;
+    for (let depth = 0; current && depth < maxDepth; depth += 1, current = current.parentElement) {
+      parts.push(getClassAndId(current));
+    }
+    return parts.join(' ');
+  }
+
+  function looksLikeCoursewareContentLabel(label) {
+    const text = cleanText(label);
+    if (!text || text.length < 2 || text.length > 140) return false;
+    if (CONFIG.blockedControlPatterns.some((pattern) => pattern.test(text))) return false;
+    if (CONFIG.nonCourseControlPatterns.some((pattern) => pattern.test(text))) return false;
+    return CONFIG.coursewareContentPatterns.some((pattern) => pattern.test(text));
+  }
+
+  function hasDottedContentNumber(label) {
+    return /^\s*\d+\.\d+/.test(cleanText(label));
+  }
+
+  function parseChineseNumber(value) {
+    const text = cleanText(value);
+    if (/^\d+$/.test(text)) return Number(text);
+
+    const digits = {
+      零: 0,
+      一: 1,
+      二: 2,
+      两: 2,
+      三: 3,
+      四: 4,
+      五: 5,
+      六: 6,
+      七: 7,
+      八: 8,
+      九: 9
+    };
+
+    if (text === '十') return 10;
+    if (text.includes('十')) {
+      const [left, right] = text.split('十');
+      const tens = left ? digits[left] || 0 : 1;
+      const ones = right ? digits[right] || 0 : 0;
+      return tens * 10 + ones;
+    }
+
+    return Array.from(text).reduce((total, char) => (total * 10) + (digits[char] || 0), 0) || null;
+  }
+
+  function getContentOrder(label) {
+    const text = cleanText(label);
+    const numberMatch = text.match(/^\s*(\d+(?:\.\d+)+)/);
+    if (numberMatch) {
+      const order = numberMatch[1].split('.').map(Number);
+      const pageMatch = text.match(/[（(]\s*(\d+)\s*[）)]/);
+      order.push(pageMatch ? Number(pageMatch[1]) : 0);
+      return order;
+    }
+
+    const chapterMatch = text.match(/^\s*第([一二两三四五六七八九十百千万\d]+)[章节课讲]/);
+    if (chapterMatch) {
+      return [parseChineseNumber(chapterMatch[1]) || 0, 0];
+    }
+
+    return null;
+  }
+
+  function compareContentOrder(left, right) {
+    if (!left || !right) return 0;
+    const length = Math.max(left.length, right.length);
+    for (let index = 0; index < length; index += 1) {
+      const diff = (left[index] || 0) - (right[index] || 0);
+      if (diff !== 0) return diff;
+    }
+    return 0;
+  }
+
+  function isCompactCoursewareCandidate(element) {
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 &&
+      rect.height > 0 &&
+      rect.height <= 96 &&
+      rect.width <= Math.max(window.innerWidth || 0, 1280);
+  }
+
+  function looksLikeCoursewareContentControl(element) {
+    if (!isVisible(element) || isDisabled(element) || !isCompactCoursewareCandidate(element)) return false;
+
+    const label = getElementLabel(element);
+    if (!looksLikeCoursewareContentLabel(label)) return false;
+    if (CONFIG.blockedControlPatterns.some((pattern) => pattern.test(getClassAndId(element)))) return false;
+    return !isNonCourseControl(element);
+  }
+
+  function getCoursewareContentCandidates(container) {
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[role="tab"]',
+      '[role="option"]',
+      '[role="menuitem"]',
+      '[onclick]',
+      'li',
+      'span',
+      '[class*="item"]',
+      '[class*="option"]',
+      '[class*="lesson"]',
+      '[class*="chapter"]',
+      '[class*="section"]',
+      '[class*="unit"]'
+    ];
+
+    const seen = new Set();
+    return Array.from(container.querySelectorAll(selectors.join(',')))
+      .map((element, index) => ({
+        element: getClickableElement(element),
+        index
+      }))
+      .filter((item) => {
+        if (!item.element || seen.has(item.element)) return false;
+        seen.add(item.element);
+        return looksLikeCoursewareContentControl(item.element);
+      })
+      .map((item) => ({
+        element: item.element,
+        index: item.index,
+        label: cleanText(getElementLabel(item.element)),
+        order: getContentOrder(getElementLabel(item.element))
+      }))
+      .filter((item) => item.order);
+  }
+
+  function getCurrentCoursewareLabel() {
+    const candidates = getCoursewareContentCandidates(document.body);
+    const activeDotted = candidates.find((item) => hasDottedContentNumber(item.label) && isActiveLessonControl(item.element));
+    if (activeDotted) return activeDotted.label;
+
+    const activeAny = candidates.find((item) => isActiveLessonControl(item.element));
+    if (activeAny) return activeAny.label;
+
+    const firstDotted = candidates.find((item) => hasDottedContentNumber(item.label));
+    if (firstDotted) return firstDotted.label;
+
+    const title = getPageTitle();
+    return looksLikeCoursewareContentLabel(title) ? title : '';
+  }
+
+  function findNextVisibleCoursewareContentControl(referenceLabel) {
+    const referenceOrder = getContentOrder(referenceLabel || getCurrentCoursewareLabel());
+    const allCandidates = getCoursewareContentCandidates(document.body);
+    if (allCandidates.length < 2) return null;
+
+    const candidates = referenceOrder && referenceOrder.length >= 3
+      ? allCandidates.filter((item) => hasDottedContentNumber(item.label) && item.order[0] === referenceOrder[0])
+      : allCandidates;
+    if (candidates.length < 2) return null;
+
+    const activeDottedIndex = candidates.findIndex((item) => hasDottedContentNumber(item.label) && isActiveLessonControl(item.element));
+    const activeIndex = activeDottedIndex >= 0
+      ? activeDottedIndex
+      : candidates.findIndex((item) => isActiveLessonControl(item.element));
+
+    if (activeIndex >= 0) {
+      const active = candidates[activeIndex];
+      const next = candidates.slice(activeIndex + 1)
+        .find((item) => !sameControl(item.element, active.element) && !isActiveLessonControl(item.element));
+      if (next) return next.element;
+    }
+
+    if (!referenceOrder) return null;
+
+    const sameIndex = candidates.findIndex((item) => compareContentOrder(item.order, referenceOrder) === 0);
+    if (sameIndex >= 0) {
+      const next = candidates.slice(sameIndex + 1)
+        .find((item) => compareContentOrder(item.order, referenceOrder) > 0);
+      if (next) return next.element;
+    }
+
+    const nextByOrder = candidates.find((item) => compareContentOrder(item.order, referenceOrder) > 0);
+    return nextByOrder ? nextByOrder.element : null;
+  }
+
+  function findCoursewareMenuToggle() {
+    const referenceLabel = getCurrentCoursewareLabel();
+    const referenceOrder = getContentOrder(referenceLabel);
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[aria-haspopup]',
+      '[aria-expanded]',
+      '[class*="select"]',
+      '[class*="dropdown"]',
+      '[class*="chapter"]',
+      '[class*="lesson"]',
+      '[class*="section"]',
+      '[class*="unit"]'
+    ];
+
+    const seen = new Set();
+    const candidates = Array.from(document.querySelectorAll(selectors.join(',')))
+      .map(getClickableElement)
+      .filter((element) => {
+        if (!element || seen.has(element)) return false;
+        seen.add(element);
+        if (!looksLikeCoursewareContentControl(element)) return false;
+        if (!hasDottedContentNumber(getElementLabel(element))) return false;
+
+        const classAndId = getClassAndIdChain(element, 4);
+        const menuish = element.getAttribute('aria-haspopup') === 'true' ||
+          element.hasAttribute('aria-expanded') ||
+          CONFIG.coursewareMenuPatterns.some((pattern) => pattern.test(classAndId));
+        if (!menuish) return false;
+
+        if (!referenceOrder) return true;
+        const order = getContentOrder(getElementLabel(element));
+        return !order || compareContentOrder(order, referenceOrder) === 0;
+      });
+
+    return candidates.find(isActiveLessonControl) || candidates[0] || null;
+  }
+
+  function openCoursewareMenuForCurrentContent() {
+    const toggle = findCoursewareMenuToggle();
+    if (!toggle) return false;
+
+    setStatus(`正在展开课件章节菜单：${getElementLabel(toggle) || '当前小节'}`);
+    toggle.click();
+    return true;
+  }
+
+  function findNextCoursewareContentControl() {
+    return findNextVisibleCoursewareContentControl(getCurrentCoursewareLabel());
+  }
+
+  function isCoursewareLearningPage() {
+    const decodedUrl = decodeURIComponent(location.href);
+    if (/讨论|讨论区|问答|答疑|评论|论坛|公告|通知|消息|分享|评价课程|评分|老师提问|提问|客服|帮助/.test(decodedUrl)) {
+      return false;
+    }
+    if (/discuss|forum|comment|notice|message|share|rating|review|question|support|help|exam|quiz|test|homework|assignment/i.test(decodedUrl)) {
+      return false;
+    }
+
+    if (/icourse163\.org$/i.test(location.hostname) || /\.icourse163\.org$/i.test(location.hostname)) {
+      const route = `${location.pathname}${location.hash}`;
+      if (/\/learn\/content/i.test(route)) {
+        return !/[?&#]type=(discuss|forum|qa|comment|exam|quiz|test|homework|assignment)/i.test(decodedUrl);
+      }
+    }
+
+    return true;
   }
 
   function parseRgb(color) {
@@ -499,7 +764,10 @@
 
     const tryClick = (attempt) => {
       const nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
-      const nextControl = nextPageControl || findNextControl();
+      const nextCoursewareControl = reason === 'reading' && !nextPageControl
+        ? findNextCoursewareContentControl()
+        : null;
+      const nextControl = nextPageControl || nextCoursewareControl || (reason === 'reading' ? null : findNextControl());
       if (nextControl) {
         state.completedContentKeys.add(completionKey);
         if (reason === 'video' && video) {
@@ -509,6 +777,8 @@
           setStatus(`已读完当前文档页，翻到下一页：${getElementLabel(nextControl) || '下一页'}`);
           state.readingStartedAt = Date.now();
           state.readingCompleted = false;
+        } else if (nextCoursewareControl) {
+          setStatus(`当前文档页已停留 ${CONFIG.documentPageDwellSeconds} 秒，进入课件下一项：${getElementLabel(nextControl) || '下一项'}`);
         } else {
           setStatus(`已完成当前${getCompletionLabel(reason)}，进入下一项：${getElementLabel(nextControl) || '下一项'}`);
         }
@@ -518,12 +788,17 @@
         return;
       }
 
+      if (reason === 'reading' && attempt === 1 && openCoursewareMenuForCurrentContent()) {
+        window.setTimeout(() => tryClick(attempt + 1), CONFIG.coursewareMenuOpenDelayMs);
+        return;
+      }
+
       if (attempt < 4) {
         window.setTimeout(() => tryClick(attempt + 1), 1000);
         return;
       }
 
-      setStatus(`已完成当前${getCompletionLabel(reason)}，但没有找到下一项按钮或课程标签。`);
+      setStatus(`已完成当前${getCompletionLabel(reason)}，但没有在课件章节内容里找到下一项。`);
       state.pendingClick = false;
     };
 
@@ -667,25 +942,29 @@
   }
 
   function updateReadingProgress() {
-    if (!document.querySelector('video')) {
+    const hasVideo = Boolean(document.querySelector('video'));
+    const inCoursewarePage = isCoursewareLearningPage();
+
+    if (!hasVideo && inCoursewarePage) {
       refreshReadingPageContext();
     }
 
     const percent = getReadingPercent();
     const dwellSeconds = Math.floor((Date.now() - state.readingStartedAt) / 1000);
 
-    if (!document.querySelector('video') &&
+    if (!hasVideo &&
+        inCoursewarePage &&
         !state.readingCompleted &&
-        percent >= CONFIG.readingCompletePercent &&
-        dwellSeconds >= CONFIG.readingDwellSeconds) {
+        dwellSeconds >= CONFIG.documentPageDwellSeconds) {
       state.readingCompleted = true;
       saveJson('readingComplete', {
         title: getPageTitle(),
         percent,
+        dwellSeconds,
         completedAt: new Date().toISOString(),
         url: location.href
       });
-      setStatus('已记录本地阅读完成。平台完成状态仍由你真实学习行为决定。');
+      setStatus(`当前文档页已停留 ${CONFIG.documentPageDwellSeconds} 秒，准备翻页或进入课件下一项。`);
       clickNextControlAfterCompletion('reading', null);
     }
 
@@ -836,7 +1115,9 @@
       ? `视频 ${formatSeconds(video.currentTime)} / ${formatSeconds(video.duration)}`
       : '视频 未检测到';
     const reading = loadJson('readingProgress', null);
-    const readingText = reading ? `阅读 ${reading.percent}%` : '阅读 未记录';
+    const readingText = reading
+      ? `文档 ${reading.percent}% · 本页 ${reading.dwellSeconds || 0}s`
+      : '文档 未记录';
 
     state.progressNode.textContent = `${videoText} · ${readingText}`;
   }
