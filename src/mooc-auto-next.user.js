@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.2.4
+// @version      0.2.6
 // @description  Save real learning progress, help read documents aloud, take notes, and go next only after a video naturally ends.
 // @author       qwdcvj
 // @match        *://icourse163.org/*
@@ -41,9 +41,28 @@
       /next/i,
       /continue/i
     ],
+    nextPageTextPatterns: [
+      /下一页/,
+      /下页/,
+      /后一页/,
+      /下一张/,
+      /下一屏/,
+      /next page/i
+    ],
     blockedControlPatterns: [
       /完成|已学完|提交|交卷|签到|打卡|考试|测验|作业|答题|评价/,
       /finish|complete|submit|exam|quiz|test|homework|assignment/i
+    ],
+    nonDocumentNextPatterns: [
+      /下一[章节课讲个]/,
+      /继续学习/,
+      /继续播放/,
+      /next lesson|next chapter|continue/i
+    ],
+    nonCourseControlPatterns: [
+      /^课件$/,
+      /讨论|讨论区|问答|答疑|评论|论坛|公告|通知|消息|分享|评价课程|评分|老师提问|提问|客服|帮助/,
+      /discuss|forum|comment|notice|message|share|rating|review|question|support|help/i
     ],
     titleSelectors: [
       'h1',
@@ -78,6 +97,7 @@
     currentVideo: null,
     readingStartedAt: Date.now(),
     readingCompleted: false,
+    readingPageSignature: '',
     scheduledScanId: 0,
     scheduledReadingId: 0,
     panel: null,
@@ -180,11 +200,18 @@
     ].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
   }
 
+  function isNonCourseControl(element) {
+    if (!element) return true;
+    const label = getElementLabel(element);
+    const classAndId = getClassAndId(element);
+    return CONFIG.nonCourseControlPatterns.some((pattern) => pattern.test(label) || pattern.test(classAndId));
+  }
+
   function looksLikeNextControl(element) {
     if (!isVisible(element) || isDisabled(element)) return false;
 
     const label = getElementLabel(element);
-    if (CONFIG.blockedControlPatterns.some((pattern) => pattern.test(label))) {
+    if (isNonCourseControl(element) || CONFIG.blockedControlPatterns.some((pattern) => pattern.test(label))) {
       return false;
     }
 
@@ -195,6 +222,27 @@
     const classAndId = `${element.id || ''} ${element.className || ''}`;
     return /next|continue|j-next|u-next/i.test(classAndId) &&
       !CONFIG.blockedControlPatterns.some((pattern) => pattern.test(classAndId));
+  }
+
+  function looksLikeNextDocumentPageControl(element) {
+    if (!isVisible(element) || isDisabled(element)) return false;
+
+    const label = getElementLabel(element);
+    if (isNonCourseControl(element) || CONFIG.blockedControlPatterns.some((pattern) => pattern.test(label))) {
+      return false;
+    }
+    if (CONFIG.nonDocumentNextPatterns.some((pattern) => pattern.test(label)) &&
+        !CONFIG.nextPageTextPatterns.some((pattern) => pattern.test(label))) {
+      return false;
+    }
+
+    if (CONFIG.nextPageTextPatterns.some((pattern) => pattern.test(label))) {
+      return true;
+    }
+
+    const classAndId = getClassAndId(element);
+    const parentText = getClassAndId(element.parentElement || document.body);
+    return /(next[-_\s]?page|page[-_\s]?next|pager.*next|pagination.*next|pdf.*next|reader.*next)/i.test(`${classAndId} ${parentText}`);
   }
 
   function getClickableElement(element) {
@@ -209,6 +257,7 @@
     const label = getElementLabel(element);
     return isVisible(element) &&
       !isDisabled(element) &&
+      !isNonCourseControl(element) &&
       label.length >= 2 &&
       label.length <= 120 &&
       !CONFIG.blockedControlPatterns.some((pattern) => pattern.test(label));
@@ -320,7 +369,9 @@
     const activeElements = [
       ...Array.from(document.querySelectorAll(activeSelectors.join(','))).map(getClickableElement),
       ...getLessonCandidates(document.body).filter(isActiveLessonControl)
-    ].filter(Boolean).filter(isVisible);
+    ].filter(Boolean)
+      .filter(isVisible)
+      .filter((element) => !isNonCourseControl(element) && getElementLabel(element).length >= 2);
 
     for (const activeElement of activeElements) {
       const nextInContainer = findNextInLessonContainer(activeElement);
@@ -345,6 +396,65 @@
 
     const candidates = Array.from(document.querySelectorAll(selectors.join(',')));
     return candidates.find(looksLikeNextControl) || findAdjacentLessonControl();
+  }
+
+  function findAdjacentDocumentPageControl() {
+    const activeSelectors = [
+      '[aria-current="page"]',
+      '[aria-selected="true"]',
+      '.active',
+      '.current',
+      '.selected',
+      '.z-crt',
+      '.z-sel',
+      '.cur',
+      '.on'
+    ];
+
+    const activeElements = Array.from(document.querySelectorAll(activeSelectors.join(',')))
+      .map(getClickableElement)
+      .filter(Boolean)
+      .filter((element) => {
+        const label = getElementLabel(element);
+        return isVisible(element) && /^\d+$/.test(label);
+      });
+
+    for (const activeElement of activeElements) {
+      let container = activeElement.parentElement;
+      for (let depth = 0; container && depth < 4; depth += 1, container = container.parentElement) {
+        const pageCandidates = Array.from(container.querySelectorAll('button,a,[role="button"],[onclick],li,span'))
+          .map(getClickableElement)
+          .filter(Boolean)
+          .filter((element, index, list) => list.indexOf(element) === index)
+          .filter((element) => isVisible(element) && /^\d+$/.test(getElementLabel(element)));
+
+        const activeIndex = pageCandidates.findIndex((candidate) => sameControl(candidate, activeElement));
+        if (activeIndex < 0 || activeIndex >= pageCandidates.length - 1) continue;
+
+        const nextPage = pageCandidates[activeIndex + 1];
+        if (!isDisabled(nextPage)) return nextPage;
+      }
+    }
+
+    return null;
+  }
+
+  function findNextDocumentPageControl() {
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[onclick]',
+      '.next-page',
+      '.page-next',
+      '.pager-next',
+      '.pagination-next',
+      '.u-next',
+      '.j-next'
+    ];
+
+    const candidates = Array.from(document.querySelectorAll(selectors.join(',')));
+    return candidates.find(looksLikeNextDocumentPageControl) || findAdjacentDocumentPageControl();
   }
 
   function clickNextControlAfterVideo(video) {
@@ -381,19 +491,27 @@
     if (!shouldAutoNextAfterCompletion(reason) || state.pendingClick) return;
     if (reason === 'video' && video && state.completedVideos.has(video)) return;
 
-    const completionKey = `${reason}:${location.origin}${location.pathname}${location.hash}`;
+    const readingKey = reason === 'reading' ? `:${state.readingPageSignature || getDocumentPageSignature()}` : '';
+    const completionKey = `${reason}:${location.origin}${location.pathname}${location.hash}${readingKey}`;
     if (state.completedContentKeys.has(completionKey)) return;
 
     state.pendingClick = true;
 
     const tryClick = (attempt) => {
-      const nextControl = findNextControl();
+      const nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
+      const nextControl = nextPageControl || findNextControl();
       if (nextControl) {
         state.completedContentKeys.add(completionKey);
         if (reason === 'video' && video) {
           state.completedVideos.add(video);
         }
-        setStatus(`已完成当前${getCompletionLabel(reason)}，进入下一项：${getElementLabel(nextControl) || '下一项'}`);
+        if (nextPageControl) {
+          setStatus(`已读完当前文档页，翻到下一页：${getElementLabel(nextControl) || '下一页'}`);
+          state.readingStartedAt = Date.now();
+          state.readingCompleted = false;
+        } else {
+          setStatus(`已完成当前${getCompletionLabel(reason)}，进入下一项：${getElementLabel(nextControl) || '下一项'}`);
+        }
         log('Clicking next control after completion:', reason, getElementLabel(nextControl));
         nextControl.click();
         state.pendingClick = false;
@@ -508,6 +626,37 @@
     return candidates[0] ? candidates[0].element : document.body;
   }
 
+  function getDocumentPageSignature() {
+    const root = getReadableRoot();
+    const text = cleanText(root.innerText || root.textContent);
+    const visiblePageMarker = Array.from(document.querySelectorAll('[aria-current="page"],[aria-selected="true"],.active,.current,.selected,.z-crt,.z-sel,.cur,.on'))
+      .filter(isVisible)
+      .map(getElementLabel)
+      .filter(Boolean)
+      .slice(0, 5)
+      .join('|');
+
+    return [
+      location.origin,
+      location.pathname,
+      location.hash,
+      visiblePageMarker,
+      text.length,
+      text.slice(0, 160),
+      text.slice(-160)
+    ].join('::');
+  }
+
+  function refreshReadingPageContext() {
+    const signature = getDocumentPageSignature();
+    if (state.readingPageSignature && state.readingPageSignature !== signature) {
+      state.readingStartedAt = Date.now();
+      state.readingCompleted = false;
+      setStatus('检测到文档页面变化，开始记录新页面阅读进度。');
+    }
+    state.readingPageSignature = signature;
+  }
+
   function getReadingPercent() {
     const root = getReadableRoot();
     const rect = root.getBoundingClientRect();
@@ -518,6 +667,10 @@
   }
 
   function updateReadingProgress() {
+    if (!document.querySelector('video')) {
+      refreshReadingPageContext();
+    }
+
     const percent = getReadingPercent();
     const dwellSeconds = Math.floor((Date.now() - state.readingStartedAt) / 1000);
 
