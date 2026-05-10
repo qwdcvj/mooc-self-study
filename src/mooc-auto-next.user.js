@@ -769,7 +769,9 @@
         : null;
       const nextControl = nextPageControl || nextCoursewareControl || (reason === 'reading' ? null : findNextControl());
       if (nextControl) {
-        state.completedContentKeys.add(completionKey);
+        if (!nextPageControl) {
+          state.completedContentKeys.add(completionKey);
+        }
         if (reason === 'video' && video) {
           state.completedVideos.add(video);
         }
