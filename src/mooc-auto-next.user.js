@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.2.2
+// @version      0.2.4
 // @description  Save real learning progress, help read documents aloud, take notes, and go next only after a video naturally ends.
 // @author       qwdcvj
 // @match        *://icourse163.org/*
@@ -21,7 +21,10 @@
 
   const CONFIG = {
     clickDelayMs: 1200,
-    scanIntervalMs: 1500,
+    scanIntervalMs: 3000,
+    readingIntervalMs: 10000,
+    mutationDebounceMs: 800,
+    scrollDebounceMs: 500,
     saveVideoEveryMs: 5000,
     restoreSafeGapSeconds: 15,
     readingCompletePercent: 95,
@@ -68,13 +71,17 @@
   const state = {
     watchedVideos: new WeakSet(),
     completedVideos: new WeakSet(),
+    completedContentKeys: new Set(),
     videoSaveTimers: new WeakMap(),
     pendingClick: false,
     lastUrl: location.href,
     currentVideo: null,
     readingStartedAt: Date.now(),
     readingCompleted: false,
+    scheduledScanId: 0,
+    scheduledReadingId: 0,
     panel: null,
+    launcher: null,
     notesInput: null,
     statusNode: null,
     progressNode: null,
@@ -83,10 +90,18 @@
   };
 
   const settings = loadJson('settings', {
+    autoNextAfterComplete: true,
     autoNextAfterVideo: true,
     restoreVideoProgress: true,
     showPanel: true
   });
+
+  if (typeof settings.autoNextAfterComplete === 'undefined') {
+    settings.autoNextAfterComplete = true;
+  }
+  if (typeof settings.autoNextAfterVideo === 'undefined') {
+    settings.autoNextAfterVideo = true;
+  }
 
   function log(...args) {
     if (CONFIG.debug) {
@@ -187,7 +202,7 @@
     if (element.matches('button,a,[role="button"],[role="tab"]')) {
       return element;
     }
-    return element.querySelector('button,a,[role="button"],[role="tab"]') || element;
+    return element.querySelector('button,a,[role="button"],[role="tab"],[onclick]') || element;
   }
 
   function looksLikeLessonControl(element) {
@@ -199,6 +214,90 @@
       !CONFIG.blockedControlPatterns.some((pattern) => pattern.test(label));
   }
 
+  function getClassAndId(element) {
+    return `${element.id || ''} ${element.className || ''}`;
+  }
+
+  function parseRgb(color) {
+    const match = String(color || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+    return match ? match.slice(1, 4).map(Number) : null;
+  }
+
+  function isGreenish(color) {
+    const rgb = parseRgb(color);
+    if (!rgb) return false;
+    const [red, green, blue] = rgb;
+    return green >= 120 && green > red * 1.25 && green > blue * 1.1;
+  }
+
+  function isActiveLessonControl(element) {
+    if (!element || !isVisible(element)) return false;
+    if (element.getAttribute('aria-selected') === 'true' || element.getAttribute('aria-current') === 'true') {
+      return true;
+    }
+
+    const classAndId = getClassAndId(element);
+    if (/(^|[-_\s])(active|current|selected|checked|crt|cur|on|z-crt|z-sel|u-cur)([-_\s]|$)/i.test(classAndId)) {
+      return true;
+    }
+
+    const style = window.getComputedStyle(element);
+    return isGreenish(style.color) || isGreenish(style.borderColor) || isGreenish(style.backgroundColor);
+  }
+
+  function getLessonCandidates(container) {
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[role="tab"]',
+      '[onclick]',
+      '[class*="tab"]',
+      '[class*="lesson"]',
+      '[class*="chapter"]',
+      '[class*="section"]',
+      '[class*="unit"]',
+      '[class*="item"]',
+      '[class*="f-fl"]',
+      '[class*="u-"]',
+      '[class*="j-"]'
+    ];
+
+    const seen = new Set();
+    return Array.from(container.querySelectorAll(selectors.join(',')))
+      .map(getClickableElement)
+      .filter(Boolean)
+      .filter((element) => {
+        if (seen.has(element)) return false;
+        seen.add(element);
+        return looksLikeLessonControl(element);
+      });
+  }
+
+  function sameControl(left, right) {
+    if (!left || !right) return false;
+    return left === right ||
+      left.contains(right) ||
+      right.contains(left) ||
+      getElementLabel(left) === getElementLabel(right);
+  }
+
+  function findNextInLessonContainer(activeElement) {
+    let container = activeElement.parentElement;
+    for (let depth = 0; container && depth < 6; depth += 1, container = container.parentElement) {
+      const candidates = getLessonCandidates(container);
+      if (candidates.length < 2 || candidates.length > 40) continue;
+
+      const activeIndex = candidates.findIndex((candidate) => sameControl(candidate, activeElement));
+      if (activeIndex < 0) continue;
+
+      return candidates.slice(activeIndex + 1)
+        .find((candidate) => !isActiveLessonControl(candidate)) || null;
+    }
+
+    return null;
+  }
+
   function findAdjacentLessonControl() {
     const activeSelectors = [
       'button.active',
@@ -208,27 +307,24 @@
       '.current',
       '.selected',
       '.z-sel',
-      '.u-cur'
+      '.z-crt',
+      '.u-cur',
+      '.cur',
+      '.crt',
+      '.on',
+      '[class*="active"]',
+      '[class*="current"]',
+      '[class*="selected"]'
     ];
 
-    const activeElements = Array.from(document.querySelectorAll(activeSelectors.join(',')))
-      .map((element) => element.closest('button,a,[role="button"],[role="tab"],li,div') || element)
-      .filter(isVisible);
+    const activeElements = [
+      ...Array.from(document.querySelectorAll(activeSelectors.join(','))).map(getClickableElement),
+      ...getLessonCandidates(document.body).filter(isActiveLessonControl)
+    ].filter(Boolean).filter(isVisible);
 
     for (const activeElement of activeElements) {
-      const parent = activeElement.parentElement;
-      if (!parent) continue;
-
-      const siblings = Array.from(parent.children);
-      const startIndex = siblings.indexOf(activeElement);
-      if (startIndex < 0) continue;
-
-      for (const sibling of siblings.slice(startIndex + 1)) {
-        const clickable = getClickableElement(sibling);
-        if (clickable && looksLikeLessonControl(clickable)) {
-          return clickable;
-        }
-      }
+      const nextInContainer = findNextInLessonContainer(activeElement);
+      if (nextInContainer) return nextInContainer;
     }
 
     return null;
@@ -268,6 +364,52 @@
       }
       state.pendingClick = false;
     }, CONFIG.clickDelayMs);
+  }
+
+  function shouldAutoNextAfterCompletion(reason) {
+    if (settings.autoNextAfterComplete === false) return false;
+    return reason !== 'video' || settings.autoNextAfterVideo !== false;
+  }
+
+  function getCompletionLabel(reason) {
+    if (reason === 'video') return '视频';
+    if (reason === 'reading') return '文档';
+    return '内容';
+  }
+
+  function clickNextControlAfterCompletion(reason, video) {
+    if (!shouldAutoNextAfterCompletion(reason) || state.pendingClick) return;
+    if (reason === 'video' && video && state.completedVideos.has(video)) return;
+
+    const completionKey = `${reason}:${location.origin}${location.pathname}${location.hash}`;
+    if (state.completedContentKeys.has(completionKey)) return;
+
+    state.pendingClick = true;
+
+    const tryClick = (attempt) => {
+      const nextControl = findNextControl();
+      if (nextControl) {
+        state.completedContentKeys.add(completionKey);
+        if (reason === 'video' && video) {
+          state.completedVideos.add(video);
+        }
+        setStatus(`已完成当前${getCompletionLabel(reason)}，进入下一项：${getElementLabel(nextControl) || '下一项'}`);
+        log('Clicking next control after completion:', reason, getElementLabel(nextControl));
+        nextControl.click();
+        state.pendingClick = false;
+        return;
+      }
+
+      if (attempt < 4) {
+        window.setTimeout(() => tryClick(attempt + 1), 1000);
+        return;
+      }
+
+      setStatus(`已完成当前${getCompletionLabel(reason)}，但没有找到下一项按钮或课程标签。`);
+      state.pendingClick = false;
+    };
+
+    window.setTimeout(() => tryClick(1), CONFIG.clickDelayMs);
   }
 
   function getVideoProgress(video) {
@@ -334,13 +476,13 @@
         url: location.href
       });
       setStatus('视频已自然播放结束。');
-      clickNextControlAfterVideo(video);
+      clickNextControlAfterCompletion('video', video);
     });
 
     if (video.ended) {
       saveVideoProgress(video);
       setStatus('检测到视频已经播放结束，准备进入下一节。');
-      clickNextControlAfterVideo(video);
+      clickNextControlAfterCompletion('video', video);
     }
 
     const timerId = window.setInterval(() => saveVideoProgress(video), CONFIG.saveVideoEveryMs);
@@ -379,7 +521,8 @@
     const percent = getReadingPercent();
     const dwellSeconds = Math.floor((Date.now() - state.readingStartedAt) / 1000);
 
-    if (!state.readingCompleted &&
+    if (!document.querySelector('video') &&
+        !state.readingCompleted &&
         percent >= CONFIG.readingCompletePercent &&
         dwellSeconds >= CONFIG.readingDwellSeconds) {
       state.readingCompleted = true;
@@ -390,6 +533,7 @@
         url: location.href
       });
       setStatus('已记录本地阅读完成。平台完成状态仍由你真实学习行为决定。');
+      clickNextControlAfterCompletion('reading', null);
     }
 
     saveJson('readingProgress', {
@@ -539,7 +683,7 @@
       ? `视频 ${formatSeconds(video.currentTime)} / ${formatSeconds(video.duration)}`
       : '视频 未检测到';
     const reading = loadJson('readingProgress', null);
-    const readingText = reading ? `阅读 ${reading.percent}%` : `阅读 ${getReadingPercent()}%`;
+    const readingText = reading ? `阅读 ${reading.percent}%` : '阅读 未记录';
 
     state.progressNode.textContent = `${videoText} · ${readingText}`;
   }
@@ -574,11 +718,57 @@
     return wrapper;
   }
 
-  function createPanel() {
-    if (state.panel || !settings.showPanel) return;
+  function createLauncher() {
+    if (state.launcher || state.panel) return;
 
-    const style = document.createElement('style');
-    style.textContent = `
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.id = 'mooc-study-assistant-launcher';
+    button.textContent = '学';
+    button.title = '打开 MOOC 学习助手';
+    Object.assign(button.style, {
+      position: 'fixed',
+      right: '16px',
+      bottom: '16px',
+      zIndex: '2147483647',
+      width: '44px',
+      height: '44px',
+      border: '1px solid #16a34a',
+      borderRadius: '22px',
+      background: '#22c55e',
+      color: '#ffffff',
+      font: '700 18px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif',
+      boxShadow: '0 10px 24px rgba(15, 23, 42, 0.2)',
+      cursor: 'pointer'
+    });
+    button.addEventListener('click', () => {
+      settings.showPanel = true;
+      saveSettings();
+      button.remove();
+      state.launcher = null;
+      createPanel();
+    });
+
+    document.documentElement.append(button);
+    state.launcher = button;
+  }
+
+  function createPanel() {
+    if (state.panel) return;
+    if (!settings.showPanel) {
+      createLauncher();
+      return;
+    }
+    if (state.launcher) {
+      state.launcher.remove();
+      state.launcher = null;
+    }
+
+    let style = document.getElementById('mooc-study-assistant-style');
+    if (!style) {
+      style = document.createElement('style');
+      style.id = 'mooc-study-assistant-style';
+      style.textContent = `
       #mooc-study-assistant-panel {
         position: fixed;
         right: 16px;
@@ -650,6 +840,7 @@
         color: #2563eb;
       }
     `;
+    }
 
     const panel = document.createElement('section');
     panel.id = 'mooc-study-assistant-panel';
@@ -657,10 +848,10 @@
 
     const closeButton = createButton('收起', () => {
       panel.remove();
-      style.remove();
       state.panel = null;
       settings.showPanel = false;
       saveSettings();
+      createLauncher();
     });
     panel.querySelector('header').append(closeButton);
 
@@ -673,7 +864,7 @@
 
     const toggles = document.createElement('div');
     toggles.append(
-      createToggle('视频结束后下一节', 'autoNextAfterVideo'),
+      createToggle('完成后下一节', 'autoNextAfterComplete'),
       createToggle('恢复视频进度', 'restoreVideoProgress')
     );
 
@@ -719,13 +910,27 @@
     setStatus('已切换页面，重新记录本节学习进度。');
   }
 
-  const observer = new MutationObserver(() => {
-    scanVideos();
-    updateProgress();
-  });
+  function scheduleScan() {
+    if (state.scheduledScanId) return;
+    state.scheduledScanId = window.setTimeout(() => {
+      state.scheduledScanId = 0;
+      scanVideos();
+      updateProgress();
+    }, CONFIG.mutationDebounceMs);
+  }
+
+  function scheduleReadingProgress() {
+    if (state.scheduledReadingId) return;
+    state.scheduledReadingId = window.setTimeout(() => {
+      state.scheduledReadingId = 0;
+      updateReadingProgress();
+    }, CONFIG.scrollDebounceMs);
+  }
+
+  const observer = new MutationObserver(scheduleScan);
   observer.observe(document.documentElement, { childList: true, subtree: true });
 
-  window.addEventListener('scroll', updateReadingProgress, { passive: true });
+  window.addEventListener('scroll', scheduleReadingProgress, { passive: true });
   window.addEventListener('beforeunload', () => {
     const video = state.currentVideo || document.querySelector('video');
     if (video) saveVideoProgress(video);
@@ -737,8 +942,10 @@
       resetForRouteChange();
     }
     scanVideos();
-    updateReadingProgress();
+    updateProgress();
   }, CONFIG.scanIntervalMs);
+
+  window.setInterval(updateReadingProgress, CONFIG.readingIntervalMs);
 
   scanVideos();
   createPanel();
