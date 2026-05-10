@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.2.1
+// @version      0.2.2
 // @description  Save real learning progress, help read documents aloud, take notes, and go next only after a video naturally ends.
 // @author       qwdcvj
 // @match        *://icourse163.org/*
@@ -182,6 +182,58 @@
       !CONFIG.blockedControlPatterns.some((pattern) => pattern.test(classAndId));
   }
 
+  function getClickableElement(element) {
+    if (!element) return null;
+    if (element.matches('button,a,[role="button"],[role="tab"]')) {
+      return element;
+    }
+    return element.querySelector('button,a,[role="button"],[role="tab"]') || element;
+  }
+
+  function looksLikeLessonControl(element) {
+    const label = getElementLabel(element);
+    return isVisible(element) &&
+      !isDisabled(element) &&
+      label.length >= 2 &&
+      label.length <= 120 &&
+      !CONFIG.blockedControlPatterns.some((pattern) => pattern.test(label));
+  }
+
+  function findAdjacentLessonControl() {
+    const activeSelectors = [
+      'button.active',
+      'a.active',
+      '[role="tab"][aria-selected="true"]',
+      '.active',
+      '.current',
+      '.selected',
+      '.z-sel',
+      '.u-cur'
+    ];
+
+    const activeElements = Array.from(document.querySelectorAll(activeSelectors.join(',')))
+      .map((element) => element.closest('button,a,[role="button"],[role="tab"],li,div') || element)
+      .filter(isVisible);
+
+    for (const activeElement of activeElements) {
+      const parent = activeElement.parentElement;
+      if (!parent) continue;
+
+      const siblings = Array.from(parent.children);
+      const startIndex = siblings.indexOf(activeElement);
+      if (startIndex < 0) continue;
+
+      for (const sibling of siblings.slice(startIndex + 1)) {
+        const clickable = getClickableElement(sibling);
+        if (clickable && looksLikeLessonControl(clickable)) {
+          return clickable;
+        }
+      }
+    }
+
+    return null;
+  }
+
   function findNextControl() {
     const selectors = [
       'button',
@@ -196,7 +248,7 @@
     ];
 
     const candidates = Array.from(document.querySelectorAll(selectors.join(',')));
-    return candidates.find(looksLikeNextControl) || null;
+    return candidates.find(looksLikeNextControl) || findAdjacentLessonControl();
   }
 
   function clickNextControlAfterVideo(video) {
