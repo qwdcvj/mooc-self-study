@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.3.1
+// @version      0.3.2
 // @description  Save real learning progress, confirm reader page turns, and stay inside courseware menus.
 // @author       qwdcvj
 // @match        *://icourse163.org/*
@@ -312,6 +312,28 @@
     return /^\s*\d+\.\d+/.test(cleanText(label));
   }
 
+  function isChapterLabel(label) {
+    return /^第[一二两三四五六七八九十百千万\d]+章/.test(cleanText(label));
+  }
+
+  function isMenuToggleElement(element) {
+    if (!element) return false;
+    const classAndId = getClassAndIdChain(element, 4);
+    return element.getAttribute('aria-haspopup') === 'true' ||
+      element.hasAttribute('aria-expanded') ||
+      CONFIG.coursewareMenuPatterns.some((pattern) => pattern.test(classAndId));
+  }
+
+  function isNearElementColumn(element, referenceElement) {
+    if (!element || !referenceElement) return true;
+    const rect = element.getBoundingClientRect();
+    const referenceRect = referenceElement.getBoundingClientRect();
+    const centerX = rect.left + rect.width / 2;
+    const referenceCenterX = referenceRect.left + referenceRect.width / 2;
+    const tolerance = Math.max(referenceRect.width * 0.75, 120);
+    return Math.abs(centerX - referenceCenterX) <= tolerance;
+  }
+
   function parseChineseNumber(value) {
     const text = cleanText(value);
     if (/^\d+$/.test(text)) return Number(text);
@@ -538,8 +560,10 @@
   }
 
   function getCurrentChapterLabel() {
-    const candidates = getCoursewareContentCandidates(document.body)
-      .filter((item) => /^第[一二两三四五六七八九十百千万\d]+章/.test(item.label));
+    const candidates = getCoursewareContentCandidates(document.body).filter((item) => isChapterLabel(item.label));
+    const toggle = candidates.find((item) => isMenuToggleElement(item.element));
+    if (toggle) return toggle.label;
+
     const active = candidates.find((item) => isActiveLessonControl(item.element));
     return active ? active.label : (candidates[0] ? candidates[0].label : '');
   }
@@ -570,13 +594,9 @@
         if (!looksLikeCoursewareContentControl(element)) return false;
 
         const label = getElementLabel(element);
-        if (!/^第[一二两三四五六七八九十百千万\d]+章/.test(cleanText(label))) return false;
+        if (!isChapterLabel(label)) return false;
 
-        const classAndId = getClassAndIdChain(element, 4);
-        const menuish = element.getAttribute('aria-haspopup') === 'true' ||
-          element.hasAttribute('aria-expanded') ||
-          CONFIG.coursewareMenuPatterns.some((pattern) => pattern.test(classAndId));
-        if (!menuish) return false;
+        if (!isMenuToggleElement(element)) return false;
 
         if (!referenceOrder) return true;
         const order = getContentOrder(label);
@@ -610,8 +630,10 @@
 
   function findNextChapterControl() {
     const referenceOrder = getContentOrder(getCurrentChapterLabel());
+    const toggle = findChapterMenuToggle();
     const candidates = getCoursewareContentCandidates(document.body)
-      .filter((item) => /^第[一二两三四五六七八九十百千万\d]+章/.test(item.label));
+      .filter((item) => isChapterLabel(item.label))
+      .filter((item) => !toggle || sameControl(item.element, toggle) || isNearElementColumn(item.element, toggle));
     if (candidates.length < 2) return null;
 
     const activeIndex = candidates.findIndex((item) => isActiveLessonControl(item.element));
@@ -794,7 +816,11 @@
     if (!match) return null;
     const current = Number(match[1]);
     const total = Number(match[2]);
-    if (!Number.isFinite(current) || !Number.isFinite(total) || total <= 1 || current >= total) {
+    if (!Number.isFinite(current) ||
+        !Number.isFinite(total) ||
+        total <= 1 ||
+        current < 1 ||
+        current > total) {
       return null;
     }
     return { current, total };
@@ -1001,6 +1027,7 @@
   function findNextReaderPagerControl() {
     const pageInfo = findDocumentPageIndicator();
     if (!pageInfo) return null;
+    if (isKnownLastDocumentPage(pageInfo)) return null;
     return findNextReaderArrowControl(pageInfo) ||
       findNextReaderArrowByPoint(pageInfo) ||
       findNextReaderThumbnailControl(pageInfo);
@@ -1025,6 +1052,10 @@
 
   function canStillTurnDocumentPage(pageState) {
     return Boolean(pageState && pageState.current && pageState.total && pageState.current < pageState.total);
+  }
+
+  function isKnownLastDocumentPage(pageState) {
+    return Boolean(pageState && pageState.current && pageState.total && pageState.current >= pageState.total);
   }
 
   function clickElementLikeMouse(element) {
@@ -1197,6 +1228,8 @@
   }
 
   function findNextDocumentPageControl() {
+    if (isKnownLastDocumentPage(findDocumentPageIndicator())) return null;
+
     const readerPagerControl = findNextReaderPagerControl();
     if (readerPagerControl) return readerPagerControl;
 
@@ -1267,6 +1300,15 @@
 
     const tryClick = (attempt, pageTurnRetries = 0) => {
       let nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
+      const currentPageState = reason === 'reading' && !nextPageControl ? getDocumentPageState() : null;
+
+      if (reason === 'reading' && !nextPageControl && isKnownLastDocumentPage(currentPageState) && attempt < 4) {
+        setStatus(`已到文档最后一页（${currentPageState.current}/${currentPageState.total}），正在回到顶部查找下一个课件小项。`);
+        scrollToCoursewareNavigation();
+        window.setTimeout(() => tryClick(4, 0), CONFIG.readerScrollDelayMs);
+        return;
+      }
+
       if (reason === 'reading' && !nextPageControl && attempt <= 2 && scrollToDocumentPagerArea()) {
         setStatus(attempt === 1
           ? '正在滑动到课件文档底部翻页栏，准备查找下一页按钮。'
@@ -1337,7 +1379,9 @@
               return;
             }
 
-            setStatus('已到文档最后一页，正在回到顶部课件菜单查找下一项。');
+            setStatus(isKnownLastDocumentPage(beforePageState)
+              ? `已到文档最后一页（${beforePageState.current}/${beforePageState.total}），正在回到顶部课件菜单查找下一项。`
+              : '没有检测到可用的文档下一页，正在回到顶部课件菜单查找下一项。');
             scrollToCoursewareNavigation();
             window.setTimeout(() => tryClick(4, 0), CONFIG.readerScrollDelayMs);
           }, CONFIG.pageTurnConfirmDelayMs);
