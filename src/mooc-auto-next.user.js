@@ -1,12 +1,16 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.2.0
+// @version      0.2.1
 // @description  Save real learning progress, help read documents aloud, take notes, and go next only after a video naturally ends.
 // @author       qwdcvj
+// @match        *://icourse163.org/*
 // @match        *://*.icourse163.org/*
+// @match        *://imooc.com/*
 // @match        *://*.imooc.com/*
+// @match        *://xuetangx.com/*
 // @match        *://*.xuetangx.com/*
+// @match        *://chaoxing.com/*
 // @match        *://*.chaoxing.com/*
 // @grant        none
 // @run-at       document-idle
@@ -63,6 +67,8 @@
 
   const state = {
     watchedVideos: new WeakSet(),
+    completedVideos: new WeakSet(),
+    videoSaveTimers: new WeakMap(),
     pendingClick: false,
     lastUrl: location.href,
     currentVideo: null,
@@ -114,10 +120,6 @@
     saveJson('settings', settings);
   }
 
-  function cleanText(text) {
-    return String(text || '').replace(/\s+/g, ' ').trim();
-  }
-
   function getPageTitle() {
     for (const selector of CONFIG.titleSelectors) {
       const element = document.querySelector(selector);
@@ -127,6 +129,10 @@
       }
     }
     return cleanText(document.title) || location.pathname;
+  }
+
+  function cleanText(text) {
+    return String(text || '').replace(/\s+/g, ' ').trim();
   }
 
   function isVisible(element) {
@@ -193,8 +199,10 @@
     return candidates.find(looksLikeNextControl) || null;
   }
 
-  function clickNextControlAfterVideo() {
+  function clickNextControlAfterVideo(video) {
     if (!settings.autoNextAfterVideo || state.pendingClick) return;
+    if (video && state.completedVideos.has(video)) return;
+    if (video) state.completedVideos.add(video);
     state.pendingClick = true;
 
     window.setTimeout(() => {
@@ -274,8 +282,17 @@
         url: location.href
       });
       setStatus('视频已自然播放结束。');
-      clickNextControlAfterVideo();
+      clickNextControlAfterVideo(video);
     });
+
+    if (video.ended) {
+      saveVideoProgress(video);
+      setStatus('检测到视频已经播放结束，准备进入下一节。');
+      clickNextControlAfterVideo(video);
+    }
+
+    const timerId = window.setInterval(() => saveVideoProgress(video), CONFIG.saveVideoEveryMs);
+    state.videoSaveTimers.set(video, timerId);
   }
 
   function scanVideos() {
