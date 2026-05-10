@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.2.9
+// @version      0.3.0
 // @description  Save real learning progress, scroll to reader pages, and stay inside courseware when moving to the next item.
 // @author       qwdcvj
 // @match        *://icourse163.org/*
@@ -55,8 +55,8 @@
       /next page/i
     ],
     blockedControlPatterns: [
-      /完成|已学完|提交|交卷|签到|打卡|考试|测验|作业|答题|评价/,
-      /finish|complete|submit|exam|quiz|test|homework|assignment/i
+      /完成|已学完|提交|交卷|签到|打卡|考试|测验|作业|答题|评价课程|课程评价|评分|认证|成绩|证书/,
+      /finish|complete|submit|exam|quiz|test|homework|assignment|certificate|certification|score|grade|credential/i
     ],
     nonDocumentNextPatterns: [
       /下一[章节课讲个]/,
@@ -66,8 +66,8 @@
     ],
     nonCourseControlPatterns: [
       /^课件$/,
-      /讨论|讨论区|问答|答疑|评论|论坛|公告|通知|消息|分享|评价课程|评分|老师提问|提问|客服|帮助/,
-      /discuss|forum|comment|notice|message|share|rating|review|question|support|help/i
+      /讨论|讨论区|问答|答疑|评论|论坛|公告|通知|消息|分享|评价课程|课程评价|评分|认证|成绩|证书|老师提问|提问|客服|帮助/,
+      /discuss|forum|comment|notice|message|share|rating|review|question|support|help|certificate|certification|score|grade|credential/i
     ],
     coursewareContentPatterns: [
       /^\s*\d+(?:\.\d+)+(?:\s|[：:、.．(（]).{1,100}/,
@@ -550,18 +550,17 @@
 
   function isCoursewareLearningPage() {
     const decodedUrl = decodeURIComponent(location.href);
-    if (/讨论|讨论区|问答|答疑|评论|论坛|公告|通知|消息|分享|评价课程|评分|老师提问|提问|客服|帮助/.test(decodedUrl)) {
+    if (/讨论|讨论区|问答|答疑|评论|论坛|公告|通知|消息|分享|评价课程|课程评价|评分|认证|成绩|证书|老师提问|提问|客服|帮助/.test(decodedUrl)) {
       return false;
     }
-    if (/discuss|forum|comment|notice|message|share|rating|review|question|support|help|exam|quiz|test|homework|assignment/i.test(decodedUrl)) {
+    if (/discuss|forum|comment|notice|message|share|rating|review|question|support|help|exam|quiz|test|homework|assignment|certificate|certification|score|grade|credential/i.test(decodedUrl)) {
       return false;
     }
 
     if (/icourse163\.org$/i.test(location.hostname) || /\.icourse163\.org$/i.test(location.hostname)) {
       const route = `${location.pathname}${location.hash}`;
-      if (/\/learn\/content/i.test(route)) {
-        return !/[?&#]type=(discuss|forum|qa|comment|exam|quiz|test|homework|assignment)/i.test(decodedUrl);
-      }
+      return /\/learn\/content/i.test(route) &&
+        !/[?&#]type=(discuss|forum|qa|comment|exam|quiz|test|homework|assignment|certificate|certification|score|grade|credential)/i.test(decodedUrl);
     }
 
     return true;
@@ -742,7 +741,63 @@
         return page ? { element, rect: element.getBoundingClientRect(), ...page } : null;
       })
       .filter(Boolean)
-      .sort((left, right) => right.rect.top - left.rect.top || left.rect.width - right.rect.width)[0] || null;
+      .sort((left, right) => right.rect.top - left.rect.top || left.rect.width - right.rect.width)[0] ||
+      findSplitDocumentPageIndicator();
+  }
+
+  function findSplitDocumentPageIndicator() {
+    const activeSelectors = [
+      '[aria-current="page"]',
+      '[aria-selected="true"]',
+      '.active',
+      '.current',
+      '.selected',
+      '.z-crt',
+      '.z-sel',
+      '.cur',
+      '.on'
+    ];
+
+    const activeNumericItems = Array.from(document.querySelectorAll(activeSelectors.join(',')))
+      .filter(isVisible)
+      .filter(isInDocumentPagerArea)
+      .filter((element) => /^\d{1,3}$/.test(getElementLabel(element)))
+      .map((element) => ({
+        element,
+        current: Number(getElementLabel(element)),
+        rect: element.getBoundingClientRect()
+      }));
+
+    for (const item of activeNumericItems) {
+      let container = item.element.parentElement;
+      for (let depth = 0; container && depth < 5; depth += 1, container = container.parentElement) {
+        if (!isVisible(container) || !isInDocumentPagerArea(container)) continue;
+
+        const label = cleanText(container.innerText || container.textContent);
+        const explicit = parsePageIndicator(label);
+        if (explicit && explicit.current === item.current) {
+          return {
+            element: container,
+            rect: container.getBoundingClientRect(),
+            current: explicit.current,
+            total: explicit.total
+          };
+        }
+
+        const numbers = (label.match(/\d{1,3}/g) || []).map(Number);
+        const total = numbers.find((value) => value > item.current);
+        if (total && total <= 300) {
+          return {
+            element: item.element,
+            rect: item.rect,
+            current: item.current,
+            total
+          };
+        }
+      }
+    }
+
+    return null;
   }
 
   function findNextReaderArrowControl(pageInfo) {
@@ -780,12 +835,39 @@
           /下一页|下页|后一页|下一张/.test(label) ||
           /(next|right|arrow|pager|page)/i.test(classAndId);
 
+        const isSmallClickTarget = rect.width <= 96 && rect.height <= 96;
+        const isProbablyArrow = looksLikeArrow || (label === '' && isSmallClickTarget);
+
         return isRightOfIndicator &&
-          looksLikeArrow &&
+          isProbablyArrow &&
+          !/^\d{1,3}$/.test(label) &&
           rect.width <= 96 &&
           rect.height <= 96 &&
           !parsePageIndicator(label);
       })[0] || null;
+  }
+
+  function findNextReaderArrowByPoint(pageInfo) {
+    if (!pageInfo || !document.elementFromPoint) return null;
+
+    const centerY = pageInfo.rect.top + pageInfo.rect.height / 2;
+    const offsets = [18, 28, 42, 60, 84, 112];
+    for (const offset of offsets) {
+      const x = Math.min(window.innerWidth - 2, pageInfo.rect.right + offset);
+      const y = Math.min(window.innerHeight - 2, Math.max(2, centerY));
+      const target = document.elementFromPoint(x, y);
+      const clickable = getClickableAncestor(target);
+      if (!clickable || sameControl(clickable, pageInfo.element) || isDisabled(clickable) || isInsideAssistant(clickable)) {
+        continue;
+      }
+
+      const label = cleanText(getElementLabel(clickable));
+      if (parsePageIndicator(label) || /^\d{1,3}$/.test(label)) continue;
+      if (!isInDocumentPagerArea(clickable)) continue;
+      return clickable;
+    }
+
+    return null;
   }
 
   function findNextReaderThumbnailControl(pageInfo) {
@@ -840,7 +922,9 @@
   function findNextReaderPagerControl() {
     const pageInfo = findDocumentPageIndicator();
     if (!pageInfo) return null;
-    return findNextReaderArrowControl(pageInfo) || findNextReaderThumbnailControl(pageInfo);
+    return findNextReaderArrowControl(pageInfo) ||
+      findNextReaderArrowByPoint(pageInfo) ||
+      findNextReaderThumbnailControl(pageInfo);
   }
 
   function scrollElementIntoView(element, block = 'center') {
@@ -1007,6 +1091,10 @@
 
   function clickNextControlAfterVideo(video) {
     if (!settings.autoNextAfterVideo || state.pendingClick) return;
+    if (!isCoursewareLearningPage()) {
+      setStatus('当前不在“课件”内容页面，已停止自动跳转。');
+      return;
+    }
     if (video && state.completedVideos.has(video)) return;
     if (video) state.completedVideos.add(video);
     state.pendingClick = true;
@@ -1037,6 +1125,10 @@
 
   function clickNextControlAfterCompletion(reason, video) {
     if (!shouldAutoNextAfterCompletion(reason) || state.pendingClick) return;
+    if (!isCoursewareLearningPage()) {
+      setStatus('当前不在“课件”内容页面，已停止自动滑动和自动跳转。');
+      return;
+    }
     if (reason === 'video' && video && state.completedVideos.has(video)) return;
 
     const readingKey = reason === 'reading' ? `:${state.readingPageSignature || getDocumentPageSignature()}` : '';
@@ -1047,13 +1139,15 @@
 
     const tryClick = (attempt) => {
       let nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
-      if (reason === 'reading' && !nextPageControl && attempt === 1 && scrollToDocumentPagerArea()) {
-        setStatus('正在滑动到文档底部翻页栏，准备查找下一页按钮。');
+      if (reason === 'reading' && !nextPageControl && attempt <= 2 && scrollToDocumentPagerArea()) {
+        setStatus(attempt === 1
+          ? '正在滑动到课件文档底部翻页栏，准备查找下一页按钮。'
+          : '继续在课件文档翻页栏查找下一页按钮。');
         window.setTimeout(() => tryClick(attempt + 1), CONFIG.readerScrollDelayMs);
         return;
       }
 
-      if (reason === 'reading' && !nextPageControl && attempt === 2) {
+      if (reason === 'reading' && !nextPageControl && attempt === 3) {
         setStatus('没有找到文档下一页，正在回到课件章节栏查找下一项。');
         scrollToCoursewareNavigation();
         window.setTimeout(() => tryClick(attempt + 1), CONFIG.readerScrollDelayMs);
@@ -1088,12 +1182,12 @@
         return;
       }
 
-      if (reason === 'reading' && attempt === 3 && openCoursewareMenuForCurrentContent()) {
+      if (reason === 'reading' && attempt === 4 && openCoursewareMenuForCurrentContent()) {
         window.setTimeout(() => tryClick(attempt + 1), CONFIG.coursewareMenuOpenDelayMs);
         return;
       }
 
-      if (attempt < 4) {
+      if (attempt < 5) {
         window.setTimeout(() => tryClick(attempt + 1), 1000);
         return;
       }
