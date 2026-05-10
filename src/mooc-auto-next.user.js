@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.3.0
-// @description  Save real learning progress, scroll to reader pages, and stay inside courseware when moving to the next item.
+// @version      0.3.1
+// @description  Save real learning progress, confirm reader page turns, and stay inside courseware menus.
 // @author       qwdcvj
 // @match        *://icourse163.org/*
 // @match        *://*.icourse163.org/*
@@ -34,6 +34,8 @@
     coursewareNavMaxTopRatio: 0.48,
     documentPagerMinTopRatio: 0.45,
     readerScrollDelayMs: 650,
+    pageTurnConfirmDelayMs: 1300,
+    pageTurnMaxRetries: 3,
     maxSpeechChars: 12000,
     debug: false,
     nextTextPatterns: [
@@ -535,6 +537,55 @@
     return candidates.find(isActiveLessonControl) || candidates[0] || null;
   }
 
+  function getCurrentChapterLabel() {
+    const candidates = getCoursewareContentCandidates(document.body)
+      .filter((item) => /^第[一二两三四五六七八九十百千万\d]+章/.test(item.label));
+    const active = candidates.find((item) => isActiveLessonControl(item.element));
+    return active ? active.label : (candidates[0] ? candidates[0].label : '');
+  }
+
+  function findChapterMenuToggle() {
+    const referenceLabel = getCurrentChapterLabel();
+    const referenceOrder = getContentOrder(referenceLabel);
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[aria-haspopup]',
+      '[aria-expanded]',
+      '[class*="select"]',
+      '[class*="dropdown"]',
+      '[class*="chapter"]',
+      '[class*="lesson"]',
+      '[class*="section"]',
+      '[class*="unit"]'
+    ];
+
+    const seen = new Set();
+    const candidates = Array.from(document.querySelectorAll(selectors.join(',')))
+      .map(getClickableElement)
+      .filter((element) => {
+        if (!element || seen.has(element)) return false;
+        seen.add(element);
+        if (!looksLikeCoursewareContentControl(element)) return false;
+
+        const label = getElementLabel(element);
+        if (!/^第[一二两三四五六七八九十百千万\d]+章/.test(cleanText(label))) return false;
+
+        const classAndId = getClassAndIdChain(element, 4);
+        const menuish = element.getAttribute('aria-haspopup') === 'true' ||
+          element.hasAttribute('aria-expanded') ||
+          CONFIG.coursewareMenuPatterns.some((pattern) => pattern.test(classAndId));
+        if (!menuish) return false;
+
+        if (!referenceOrder) return true;
+        const order = getContentOrder(label);
+        return !order || compareContentOrder(order, referenceOrder) === 0;
+      });
+
+    return candidates.find(isActiveLessonControl) || candidates[0] || null;
+  }
+
   function openCoursewareMenuForCurrentContent() {
     const toggle = findCoursewareMenuToggle();
     if (!toggle) return false;
@@ -544,8 +595,36 @@
     return true;
   }
 
+  function openChapterMenu() {
+    const toggle = findChapterMenuToggle();
+    if (!toggle) return false;
+
+    setStatus(`正在展开课件大章节菜单：${getElementLabel(toggle) || '当前章节'}`);
+    toggle.click();
+    return true;
+  }
+
   function findNextCoursewareContentControl() {
     return findNextVisibleCoursewareContentControl(getCurrentCoursewareLabel());
+  }
+
+  function findNextChapterControl() {
+    const referenceOrder = getContentOrder(getCurrentChapterLabel());
+    const candidates = getCoursewareContentCandidates(document.body)
+      .filter((item) => /^第[一二两三四五六七八九十百千万\d]+章/.test(item.label));
+    if (candidates.length < 2) return null;
+
+    const activeIndex = candidates.findIndex((item) => isActiveLessonControl(item.element));
+    if (activeIndex >= 0) {
+      const active = candidates[activeIndex];
+      const next = candidates.slice(activeIndex + 1)
+        .find((item) => compareContentOrder(item.order, active.order) > 0);
+      if (next) return next.element;
+    }
+
+    if (!referenceOrder) return null;
+    const nextByOrder = candidates.find((item) => compareContentOrder(item.order, referenceOrder) > 0);
+    return nextByOrder ? nextByOrder.element : null;
   }
 
   function isCoursewareLearningPage() {
@@ -927,6 +1006,55 @@
       findNextReaderThumbnailControl(pageInfo);
   }
 
+  function getDocumentPageState() {
+    const pageInfo = findDocumentPageIndicator();
+    return {
+      signature: getDocumentPageSignature(),
+      current: pageInfo ? pageInfo.current : null,
+      total: pageInfo ? pageInfo.total : null
+    };
+  }
+
+  function hasDocumentPageAdvanced(before, after) {
+    if (before && after && before.current && after.current && before.total === after.total) {
+      return after.current > before.current;
+    }
+
+    return Boolean(before && after && before.signature && after.signature && before.signature !== after.signature);
+  }
+
+  function canStillTurnDocumentPage(pageState) {
+    return Boolean(pageState && pageState.current && pageState.total && pageState.current < pageState.total);
+  }
+
+  function clickElementLikeMouse(element) {
+    if (!element) return false;
+    scrollElementIntoView(element, 'center');
+
+    const rect = element.getBoundingClientRect();
+    const clientX = rect.left + rect.width / 2;
+    const clientY = rect.top + rect.height / 2;
+    const options = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX,
+      clientY
+    };
+
+    ['pointerdown', 'mousedown', 'mouseup'].forEach((type) => {
+      const EventClass = type.startsWith('pointer') && typeof window.PointerEvent === 'function'
+        ? window.PointerEvent
+        : window.MouseEvent;
+      element.dispatchEvent(new EventClass(type, options));
+    });
+
+    if (typeof element.click === 'function') {
+      element.click();
+    }
+    return true;
+  }
+
   function scrollElementIntoView(element, block = 'center') {
     if (!element || typeof element.scrollIntoView !== 'function') return false;
     try {
@@ -1137,58 +1265,107 @@
 
     state.pendingClick = true;
 
-    const tryClick = (attempt) => {
+    const tryClick = (attempt, pageTurnRetries = 0) => {
       let nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
       if (reason === 'reading' && !nextPageControl && attempt <= 2 && scrollToDocumentPagerArea()) {
         setStatus(attempt === 1
           ? '正在滑动到课件文档底部翻页栏，准备查找下一页按钮。'
           : '继续在课件文档翻页栏查找下一页按钮。');
-        window.setTimeout(() => tryClick(attempt + 1), CONFIG.readerScrollDelayMs);
+        window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), CONFIG.readerScrollDelayMs);
         return;
       }
 
       if (reason === 'reading' && !nextPageControl && attempt === 3) {
-        setStatus('没有找到文档下一页，正在回到课件章节栏查找下一项。');
+        setStatus('没有找到文档下一页，正在回到课件顶部查找下一项。');
         scrollToCoursewareNavigation();
-        window.setTimeout(() => tryClick(attempt + 1), CONFIG.readerScrollDelayMs);
+        window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), CONFIG.readerScrollDelayMs);
         return;
       }
 
       nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
-      const nextCoursewareControl = reason === 'reading' && !nextPageControl
+      const nextCoursewareControl = reason === 'reading' && !nextPageControl && attempt >= 4
         ? findNextCoursewareContentControl()
         : null;
-      const nextControl = nextPageControl || nextCoursewareControl || (reason === 'reading' ? null : findNextControl());
+
+      if (reason === 'reading' && !nextPageControl && !nextCoursewareControl && attempt === 4 && openCoursewareMenuForCurrentContent()) {
+        window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), CONFIG.coursewareMenuOpenDelayMs);
+        return;
+      }
+
+      const nextChapterControl = reason === 'reading' && !nextPageControl && !nextCoursewareControl && attempt >= 5
+        ? findNextChapterControl()
+        : null;
+
+      if (reason === 'reading' && !nextPageControl && !nextCoursewareControl && !nextChapterControl && attempt === 5 && openChapterMenu()) {
+        window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), CONFIG.coursewareMenuOpenDelayMs);
+        return;
+      }
+
+      const nextControl = nextPageControl ||
+        nextCoursewareControl ||
+        nextChapterControl ||
+        (reason === 'reading' ? null : findNextControl());
       if (nextControl) {
+        if (nextPageControl) {
+          const beforePageState = getDocumentPageState();
+          setStatus(`正在点击文档下一页：${getElementLabel(nextControl) || '下一页'}`);
+          log('Clicking document next page:', getElementLabel(nextControl), beforePageState);
+          clickElementLikeMouse(nextControl);
+
+          window.setTimeout(() => {
+            const afterPageState = getDocumentPageState();
+            if (hasDocumentPageAdvanced(beforePageState, afterPageState)) {
+              setStatus(`已翻到文档第 ${afterPageState.current || ''} 页。`);
+              state.readingStartedAt = Date.now();
+              state.readingCompleted = false;
+              refreshReadingPageContext();
+              state.pendingClick = false;
+              return;
+            }
+
+            if (pageTurnRetries < CONFIG.pageTurnMaxRetries && canStillTurnDocumentPage(beforePageState)) {
+              setStatus('点击下一页后页码没有变化，正在重试翻页。');
+              scrollToDocumentPagerArea();
+              window.setTimeout(() => tryClick(1, pageTurnRetries + 1), CONFIG.readerScrollDelayMs);
+              return;
+            }
+
+            if (canStillTurnDocumentPage(beforePageState)) {
+              setStatus('下一页按钮没有响应，暂不跳到下一课件，避免漏掉当前文档页。');
+              state.readingCompleted = false;
+              state.pendingClick = false;
+              return;
+            }
+
+            setStatus('已到文档最后一页，正在回到顶部课件菜单查找下一项。');
+            scrollToCoursewareNavigation();
+            window.setTimeout(() => tryClick(4, 0), CONFIG.readerScrollDelayMs);
+          }, CONFIG.pageTurnConfirmDelayMs);
+          return;
+        }
+
         if (!nextPageControl) {
           state.completedContentKeys.add(completionKey);
         }
         if (reason === 'video' && video) {
           state.completedVideos.add(video);
         }
-        if (nextPageControl) {
-          setStatus(`已读完当前文档页，翻到下一页：${getElementLabel(nextControl) || '下一页'}`);
-          state.readingStartedAt = Date.now();
-          state.readingCompleted = false;
-        } else if (nextCoursewareControl) {
+        if (nextCoursewareControl) {
           setStatus(`当前文档页已停留 ${CONFIG.documentPageDwellSeconds} 秒，进入课件下一项：${getElementLabel(nextControl) || '下一项'}`);
+        } else if (nextChapterControl) {
+          setStatus(`当前章节已完成，进入课件下一章：${getElementLabel(nextControl) || '下一章'}`);
         } else {
           setStatus(`已完成当前${getCompletionLabel(reason)}，进入下一项：${getElementLabel(nextControl) || '下一项'}`);
         }
         log('Clicking next control after completion:', reason, getElementLabel(nextControl));
         scrollElementIntoView(nextControl, nextPageControl ? 'center' : 'nearest');
-        nextControl.click();
+        clickElementLikeMouse(nextControl);
         state.pendingClick = false;
         return;
       }
 
-      if (reason === 'reading' && attempt === 4 && openCoursewareMenuForCurrentContent()) {
-        window.setTimeout(() => tryClick(attempt + 1), CONFIG.coursewareMenuOpenDelayMs);
-        return;
-      }
-
-      if (attempt < 5) {
-        window.setTimeout(() => tryClick(attempt + 1), 1000);
+      if (attempt < 6) {
+        window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), 1000);
         return;
       }
 
