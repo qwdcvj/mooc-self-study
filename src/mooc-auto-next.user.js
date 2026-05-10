@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.2.8
-// @description  Save real learning progress, turn reader pages, and stay inside courseware when moving to the next item.
+// @version      0.2.9
+// @description  Save real learning progress, scroll to reader pages, and stay inside courseware when moving to the next item.
 // @author       qwdcvj
 // @match        *://icourse163.org/*
 // @match        *://*.icourse163.org/*
@@ -33,6 +33,7 @@
     coursewareMenuOpenDelayMs: 500,
     coursewareNavMaxTopRatio: 0.48,
     documentPagerMinTopRatio: 0.45,
+    readerScrollDelayMs: 650,
     maxSpeechChars: 12000,
     debug: false,
     nextTextPatterns: [
@@ -842,6 +843,106 @@
     return findNextReaderArrowControl(pageInfo) || findNextReaderThumbnailControl(pageInfo);
   }
 
+  function scrollElementIntoView(element, block = 'center') {
+    if (!element || typeof element.scrollIntoView !== 'function') return false;
+    try {
+      element.scrollIntoView({ behavior: 'smooth', block, inline: 'nearest' });
+      return true;
+    } catch (error) {
+      element.scrollIntoView();
+      return true;
+    }
+  }
+
+  function scrollContainerToBottom(element) {
+    if (!element) return false;
+    try {
+      if (typeof element.scrollTo === 'function') {
+        element.scrollTo({ top: element.scrollHeight, behavior: 'smooth' });
+      } else {
+        element.scrollTop = element.scrollHeight;
+      }
+      return true;
+    } catch (error) {
+      element.scrollTop = element.scrollHeight;
+      return true;
+    }
+  }
+
+  function isScrollableElement(element) {
+    if (!element || element === document.documentElement || element === document.body) return false;
+    const style = window.getComputedStyle(element);
+    const overflowY = `${style.overflowY} ${style.overflow}`;
+    return /(auto|scroll|overlay)/i.test(overflowY) &&
+      element.scrollHeight > element.clientHeight + 80 &&
+      isVisible(element);
+  }
+
+  function findDocumentScrollTargets() {
+    const selectors = [
+      'main',
+      'article',
+      '.content',
+      '.lesson-content',
+      '.course-content',
+      '[class*="reader"]',
+      '[class*="document"]',
+      '[class*="doc"]',
+      '[class*="pdf"]',
+      '[class*="ppt"]',
+      '[class*="slide"]',
+      '[class*="scroll"]',
+      '[class*="view"]',
+      '[class*="wrap"]'
+    ];
+
+    return Array.from(document.querySelectorAll(selectors.join(',')))
+      .filter(isScrollableElement)
+      .map((element) => ({
+        element,
+        rect: element.getBoundingClientRect(),
+        score: element.scrollHeight * Math.max(element.clientWidth, 1)
+      }))
+      .filter((item) => item.rect.height > 180 && item.rect.width > 220)
+      .sort((left, right) => right.score - left.score)
+      .map((item) => item.element);
+  }
+
+  function scrollToDocumentPagerArea() {
+    const pageInfo = findDocumentPageIndicator();
+    if (pageInfo) {
+      return scrollElementIntoView(pageInfo.element, 'center');
+    }
+
+    const targets = findDocumentScrollTargets();
+    let scrolled = false;
+    for (const target of targets.slice(0, 3)) {
+      scrolled = scrollContainerToBottom(target) || scrolled;
+    }
+
+    try {
+      window.scrollTo({
+        top: Math.max(document.documentElement.scrollHeight, document.body.scrollHeight),
+        behavior: 'smooth'
+      });
+      scrolled = true;
+    } catch (error) {
+      window.scrollTo(0, Math.max(document.documentElement.scrollHeight, document.body.scrollHeight));
+      scrolled = true;
+    }
+
+    return scrolled;
+  }
+
+  function scrollToCoursewareNavigation() {
+    try {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (error) {
+      window.scrollTo(0, 0);
+    }
+    return true;
+  }
+
   function findAdjacentDocumentPageControl() {
     const activeSelectors = [
       '[aria-current="page"]',
@@ -945,7 +1046,21 @@
     state.pendingClick = true;
 
     const tryClick = (attempt) => {
-      const nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
+      let nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
+      if (reason === 'reading' && !nextPageControl && attempt === 1 && scrollToDocumentPagerArea()) {
+        setStatus('正在滑动到文档底部翻页栏，准备查找下一页按钮。');
+        window.setTimeout(() => tryClick(attempt + 1), CONFIG.readerScrollDelayMs);
+        return;
+      }
+
+      if (reason === 'reading' && !nextPageControl && attempt === 2) {
+        setStatus('没有找到文档下一页，正在回到课件章节栏查找下一项。');
+        scrollToCoursewareNavigation();
+        window.setTimeout(() => tryClick(attempt + 1), CONFIG.readerScrollDelayMs);
+        return;
+      }
+
+      nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
       const nextCoursewareControl = reason === 'reading' && !nextPageControl
         ? findNextCoursewareContentControl()
         : null;
@@ -967,12 +1082,13 @@
           setStatus(`已完成当前${getCompletionLabel(reason)}，进入下一项：${getElementLabel(nextControl) || '下一项'}`);
         }
         log('Clicking next control after completion:', reason, getElementLabel(nextControl));
+        scrollElementIntoView(nextControl, nextPageControl ? 'center' : 'nearest');
         nextControl.click();
         state.pendingClick = false;
         return;
       }
 
-      if (reason === 'reading' && attempt === 1 && openCoursewareMenuForCurrentContent()) {
+      if (reason === 'reading' && attempt === 3 && openCoursewareMenuForCurrentContent()) {
         window.setTimeout(() => tryClick(attempt + 1), CONFIG.coursewareMenuOpenDelayMs);
         return;
       }
