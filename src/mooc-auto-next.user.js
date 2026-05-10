@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.2.7
-// @description  Save real learning progress, turn document pages, and stay inside courseware when moving to the next item.
+// @version      0.2.8
+// @description  Save real learning progress, turn reader pages, and stay inside courseware when moving to the next item.
 // @author       qwdcvj
 // @match        *://icourse163.org/*
 // @match        *://*.icourse163.org/*
@@ -31,6 +31,8 @@
     readingDwellSeconds: 30,
     documentPageDwellSeconds: 5,
     coursewareMenuOpenDelayMs: 500,
+    coursewareNavMaxTopRatio: 0.48,
+    documentPagerMinTopRatio: 0.45,
     maxSpeechChars: 12000,
     debug: false,
     nextTextPatterns: [
@@ -262,6 +264,16 @@
     return element.querySelector('button,a,[role="button"],[role="tab"],[onclick]') || element;
   }
 
+  function getClickableAncestor(element, maxDepth = 6) {
+    let current = element;
+    for (let depth = 0; current && depth < maxDepth; depth += 1, current = current.parentElement) {
+      if (current.matches('button,a,[role="button"],[role="tab"],[role="option"],[role="menuitem"],[onclick]')) {
+        return current;
+      }
+    }
+    return getClickableElement(element);
+  }
+
   function looksLikeLessonControl(element) {
     const label = getElementLabel(element);
     return isVisible(element) &&
@@ -362,8 +374,28 @@
       rect.width <= Math.max(window.innerWidth || 0, 1280);
   }
 
+  function isInCoursewareNavigationArea(element) {
+    const rect = element.getBoundingClientRect();
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 800;
+    if (rect.top > viewportHeight * CONFIG.coursewareNavMaxTopRatio) return false;
+
+    const classAndId = getClassAndIdChain(element, 5);
+    if (CONFIG.nonCourseControlPatterns.some((pattern) => pattern.test(classAndId))) return false;
+
+    let current = element;
+    for (let depth = 0; current && depth < 6; depth += 1, current = current.parentElement) {
+      const label = getElementLabel(current);
+      if (/课件|learn|content|course|chapter|lesson|section|unit/i.test(`${label} ${getClassAndId(current)}`)) {
+        return true;
+      }
+    }
+
+    return hasDottedContentNumber(getElementLabel(element));
+  }
+
   function looksLikeCoursewareContentControl(element) {
     if (!isVisible(element) || isDisabled(element) || !isCompactCoursewareCandidate(element)) return false;
+    if (!isInCoursewareNavigationArea(element)) return false;
 
     const label = getElementLabel(element);
     if (!looksLikeCoursewareContentLabel(label)) return false;
@@ -443,7 +475,9 @@
     if (activeIndex >= 0) {
       const active = candidates[activeIndex];
       const next = candidates.slice(activeIndex + 1)
-        .find((item) => !sameControl(item.element, active.element) && !isActiveLessonControl(item.element));
+        .find((item) => !sameControl(item.element, active.element) &&
+          !isActiveLessonControl(item.element) &&
+          compareContentOrder(item.order, active.order) > 0);
       if (next) return next.element;
     }
 
@@ -663,6 +697,151 @@
     return candidates.find(looksLikeNextControl) || findAdjacentLessonControl();
   }
 
+  function isInsideAssistant(element) {
+    return Boolean(element && element.closest && element.closest('#mooc-study-assistant-panel,#mooc-study-assistant-launcher'));
+  }
+
+  function isInDocumentPagerArea(element) {
+    if (!element || isInsideAssistant(element)) return false;
+    const rect = element.getBoundingClientRect();
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 800;
+    return rect.top >= viewportHeight * CONFIG.documentPagerMinTopRatio &&
+      rect.width > 0 &&
+      rect.height > 0;
+  }
+
+  function parsePageIndicator(label) {
+    const match = cleanText(label).match(/(?:^|\s)(\d{1,3})\s*\/\s*(\d{1,3})(?:\s|$)/);
+    if (!match) return null;
+    const current = Number(match[1]);
+    const total = Number(match[2]);
+    if (!Number.isFinite(current) || !Number.isFinite(total) || total <= 1 || current >= total) {
+      return null;
+    }
+    return { current, total };
+  }
+
+  function findDocumentPageIndicator() {
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[onclick]',
+      'span',
+      'i',
+      'em',
+      'div'
+    ];
+
+    return Array.from(document.querySelectorAll(selectors.join(',')))
+      .filter(isVisible)
+      .filter(isInDocumentPagerArea)
+      .map((element) => {
+        const page = parsePageIndicator(getElementLabel(element));
+        return page ? { element, rect: element.getBoundingClientRect(), ...page } : null;
+      })
+      .filter(Boolean)
+      .sort((left, right) => right.rect.top - left.rect.top || left.rect.width - right.rect.width)[0] || null;
+  }
+
+  function findNextReaderArrowControl(pageInfo) {
+    if (!pageInfo) return null;
+
+    const indicatorCenterY = pageInfo.rect.top + pageInfo.rect.height / 2;
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[onclick]',
+      'span',
+      'i',
+      'em',
+      'div'
+    ];
+
+    const seen = new Set();
+    return Array.from(document.querySelectorAll(selectors.join(',')))
+      .filter(isVisible)
+      .filter(isInDocumentPagerArea)
+      .map((element) => getClickableAncestor(element))
+      .filter((element) => {
+        if (!element || seen.has(element) || isDisabled(element) || sameControl(element, pageInfo.element)) return false;
+        seen.add(element);
+
+        const rect = element.getBoundingClientRect();
+        const label = cleanText(getElementLabel(element));
+        const classAndId = getClassAndIdChain(element, 3);
+        const centerY = rect.top + rect.height / 2;
+        const isRightOfIndicator = rect.left >= pageInfo.rect.right - 4 &&
+          rect.left - pageInfo.rect.right <= 140 &&
+          Math.abs(centerY - indicatorCenterY) <= 48;
+        const looksLikeArrow = /^(>|›|»|→|▶|▸|▹)$/.test(label) ||
+          /下一页|下页|后一页|下一张/.test(label) ||
+          /(next|right|arrow|pager|page)/i.test(classAndId);
+
+        return isRightOfIndicator &&
+          looksLikeArrow &&
+          rect.width <= 96 &&
+          rect.height <= 96 &&
+          !parsePageIndicator(label);
+      })[0] || null;
+  }
+
+  function findNextReaderThumbnailControl(pageInfo) {
+    if (!pageInfo) return null;
+
+    const nextPageText = String(pageInfo.current + 1);
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 800;
+    const indicatorCenterY = pageInfo.rect.top + pageInfo.rect.height / 2;
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[onclick]',
+      'span',
+      'i',
+      'em',
+      'div',
+      'li'
+    ];
+
+    const seen = new Set();
+    return Array.from(document.querySelectorAll(selectors.join(',')))
+      .filter(isVisible)
+      .filter(isInDocumentPagerArea)
+      .map((element) => {
+        const label = cleanText(getElementLabel(element));
+        if (label !== nextPageText) return null;
+
+        const clickable = getClickableAncestor(element);
+        if (!clickable || seen.has(clickable) || isDisabled(clickable)) return null;
+        seen.add(clickable);
+
+        const rect = clickable.getBoundingClientRect();
+        const centerY = rect.top + rect.height / 2;
+        const classAndId = getClassAndIdChain(clickable, 4);
+        const nearReaderPager = rect.top >= viewportHeight * CONFIG.documentPagerMinTopRatio &&
+          Math.abs(centerY - indicatorCenterY) <= 180 &&
+          rect.width <= 180 &&
+          rect.height <= 140;
+
+        if (!nearReaderPager) return null;
+        return {
+          element: clickable,
+          rect,
+          score: /(thumb|page|slide|preview|reader|pdf|ppt)/i.test(classAndId) ? 0 : 1
+        };
+      })
+      .filter(Boolean)
+      .sort((left, right) => left.score - right.score || right.rect.top - left.rect.top)[0]?.element || null;
+  }
+
+  function findNextReaderPagerControl() {
+    const pageInfo = findDocumentPageIndicator();
+    if (!pageInfo) return null;
+    return findNextReaderArrowControl(pageInfo) || findNextReaderThumbnailControl(pageInfo);
+  }
+
   function findAdjacentDocumentPageControl() {
     const activeSelectors = [
       '[aria-current="page"]',
@@ -705,6 +884,9 @@
   }
 
   function findNextDocumentPageControl() {
+    const readerPagerControl = findNextReaderPagerControl();
+    if (readerPagerControl) return readerPagerControl;
+
     const selectors = [
       'button',
       'a',
