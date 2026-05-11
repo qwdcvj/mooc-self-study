@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.3.3
+// @version      0.3.4
 // @description  Save real learning progress, confirm reader page turns, and stay inside courseware menus.
 // @author       qwdcvj
 // @homepageURL  https://github.com/qwdcvj/mooc-self-study
@@ -39,6 +39,7 @@
     readerScrollDelayMs: 650,
     pageTurnConfirmDelayMs: 1300,
     pageTurnMaxRetries: 3,
+    pageIndicatorMaxFindAttempts: 4,
     maxSpeechChars: 12000,
     debug: false,
     nextTextPatterns: [
@@ -115,6 +116,7 @@
     readingStartedAt: Date.now(),
     readingCompleted: false,
     readingPageSignature: '',
+    documentReadyForCoursewareNext: false,
     scheduledScanId: 0,
     scheduledReadingId: 0,
     panel: null,
@@ -613,8 +615,8 @@
     const toggle = findCoursewareMenuToggle();
     if (!toggle) return false;
 
-    setStatus(`正在展开课件章节菜单：${getElementLabel(toggle) || '当前小节'}`);
-    toggle.click();
+    setStatus(`正在点击右侧小节菜单按钮：${getElementLabel(toggle) || '当前小节'}`);
+    clickElementLikeMouse(toggle, { xRatio: 0.92 });
     return true;
   }
 
@@ -622,8 +624,8 @@
     const toggle = findChapterMenuToggle();
     if (!toggle) return false;
 
-    setStatus(`正在展开课件大章节菜单：${getElementLabel(toggle) || '当前章节'}`);
-    toggle.click();
+    setStatus(`正在点击左侧章节菜单按钮：${getElementLabel(toggle) || '当前章节'}`);
+    clickElementLikeMouse(toggle, { xRatio: 0.92 });
     return true;
   }
 
@@ -1061,13 +1063,15 @@
     return Boolean(pageState && pageState.current && pageState.total && pageState.current >= pageState.total);
   }
 
-  function clickElementLikeMouse(element) {
+  function clickElementLikeMouse(element, pointerOptions = {}) {
     if (!element) return false;
     scrollElementIntoView(element, 'center');
 
     const rect = element.getBoundingClientRect();
-    const clientX = rect.left + rect.width / 2;
-    const clientY = rect.top + rect.height / 2;
+    const xRatio = Number.isFinite(pointerOptions.xRatio) ? pointerOptions.xRatio : 0.5;
+    const yRatio = Number.isFinite(pointerOptions.yRatio) ? pointerOptions.yRatio : 0.5;
+    const clientX = rect.left + rect.width * Math.min(Math.max(xRatio, 0.05), 0.95);
+    const clientY = rect.top + rect.height * Math.min(Math.max(yRatio, 0.05), 0.95);
     const options = {
       bubbles: true,
       cancelable: true,
@@ -1305,14 +1309,30 @@
       let nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
       const currentPageState = reason === 'reading' && !nextPageControl ? getDocumentPageState() : null;
 
+      if (reason === 'reading' && !nextPageControl && canStillTurnDocumentPage(currentPageState)) {
+        state.documentReadyForCoursewareNext = false;
+        if (attempt <= CONFIG.pageIndicatorMaxFindAttempts) {
+          setStatus(`文档还没翻完（${currentPageState.current}/${currentPageState.total}），继续寻找并点击下一页按钮。`);
+          scrollToDocumentPagerArea();
+          window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), CONFIG.readerScrollDelayMs);
+          return;
+        }
+
+        setStatus(`文档还没翻完（${currentPageState.current}/${currentPageState.total}），但没有找到可点击的下一页按钮，已停止切换课件。`);
+        state.readingCompleted = false;
+        state.pendingClick = false;
+        return;
+      }
+
       if (reason === 'reading' && !nextPageControl && isKnownLastDocumentPage(currentPageState) && attempt < 4) {
+        state.documentReadyForCoursewareNext = true;
         setStatus(`已到文档最后一页（${currentPageState.current}/${currentPageState.total}），正在回到顶部查找下一个课件小项。`);
         scrollToCoursewareNavigation();
         window.setTimeout(() => tryClick(4, 0), CONFIG.readerScrollDelayMs);
         return;
       }
 
-      if (reason === 'reading' && !nextPageControl && attempt <= 2 && scrollToDocumentPagerArea()) {
+      if (reason === 'reading' && !nextPageControl && !state.documentReadyForCoursewareNext && attempt <= CONFIG.pageIndicatorMaxFindAttempts && scrollToDocumentPagerArea()) {
         setStatus(attempt === 1
           ? '正在滑动到课件文档底部翻页栏，准备查找下一页按钮。'
           : '继续在课件文档翻页栏查找下一页按钮。');
@@ -1320,28 +1340,29 @@
         return;
       }
 
-      if (reason === 'reading' && !nextPageControl && attempt === 3) {
-        setStatus('没有找到文档下一页，正在回到课件顶部查找下一项。');
-        scrollToCoursewareNavigation();
-        window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), CONFIG.readerScrollDelayMs);
+      if (reason === 'reading' && !nextPageControl && !state.documentReadyForCoursewareNext) {
+        setStatus('还没有确认文档已经到最后一页，已停止寻找下一篇内容，避免提前跳过文档。');
+        state.readingCompleted = false;
+        state.pendingClick = false;
         return;
       }
 
       nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
-      const nextCoursewareControl = reason === 'reading' && !nextPageControl && attempt >= 4
+      const allowCoursewareNext = reason !== 'reading' || state.documentReadyForCoursewareNext;
+      const nextCoursewareControl = reason === 'reading' && allowCoursewareNext && !nextPageControl && attempt >= 4
         ? findNextCoursewareContentControl()
         : null;
 
-      if (reason === 'reading' && !nextPageControl && !nextCoursewareControl && attempt === 4 && openCoursewareMenuForCurrentContent()) {
+      if (reason === 'reading' && allowCoursewareNext && !nextPageControl && !nextCoursewareControl && attempt === 4 && openCoursewareMenuForCurrentContent()) {
         window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), CONFIG.coursewareMenuOpenDelayMs);
         return;
       }
 
-      const nextChapterControl = reason === 'reading' && !nextPageControl && !nextCoursewareControl && attempt >= 5
+      const nextChapterControl = reason === 'reading' && allowCoursewareNext && !nextPageControl && !nextCoursewareControl && attempt >= 5
         ? findNextChapterControl()
         : null;
 
-      if (reason === 'reading' && !nextPageControl && !nextCoursewareControl && !nextChapterControl && attempt === 5 && openChapterMenu()) {
+      if (reason === 'reading' && allowCoursewareNext && !nextPageControl && !nextCoursewareControl && !nextChapterControl && attempt === 5 && openChapterMenu()) {
         window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), CONFIG.coursewareMenuOpenDelayMs);
         return;
       }
@@ -1363,6 +1384,7 @@
               setStatus(`已翻到文档第 ${afterPageState.current || ''} 页。`);
               state.readingStartedAt = Date.now();
               state.readingCompleted = false;
+              state.documentReadyForCoursewareNext = isKnownLastDocumentPage(afterPageState);
               refreshReadingPageContext();
               state.pendingClick = false;
               return;
@@ -1378,13 +1400,25 @@
             if (canStillTurnDocumentPage(beforePageState)) {
               setStatus('下一页按钮没有响应，暂不跳到下一课件，避免漏掉当前文档页。');
               state.readingCompleted = false;
+              state.documentReadyForCoursewareNext = false;
               state.pendingClick = false;
               return;
             }
 
-            setStatus(isKnownLastDocumentPage(beforePageState)
-              ? `已到文档最后一页（${beforePageState.current}/${beforePageState.total}），正在回到顶部课件菜单查找下一项。`
-              : '没有检测到可用的文档下一页，正在回到顶部课件菜单查找下一项。');
+            const lastPageState = isKnownLastDocumentPage(afterPageState)
+              ? afterPageState
+              : (isKnownLastDocumentPage(beforePageState) ? beforePageState : null);
+
+            if (!lastPageState) {
+              setStatus('没有确认文档已经到最后一页，已停止寻找下一篇内容，避免提前跳过文档。');
+              state.readingCompleted = false;
+              state.documentReadyForCoursewareNext = false;
+              state.pendingClick = false;
+              return;
+            }
+
+            state.documentReadyForCoursewareNext = true;
+            setStatus(`已到文档最后一页（${lastPageState.current}/${lastPageState.total}），正在回到顶部课件菜单查找下一项。`);
             scrollToCoursewareNavigation();
             window.setTimeout(() => tryClick(4, 0), CONFIG.readerScrollDelayMs);
           }, CONFIG.pageTurnConfirmDelayMs);
@@ -1393,6 +1427,7 @@
 
         if (!nextPageControl) {
           state.completedContentKeys.add(completionKey);
+          state.documentReadyForCoursewareNext = false;
         }
         if (reason === 'video' && video) {
           state.completedVideos.add(video);
@@ -1545,6 +1580,7 @@
     if (state.readingPageSignature && state.readingPageSignature !== signature) {
       state.readingStartedAt = Date.now();
       state.readingCompleted = false;
+      state.documentReadyForCoursewareNext = false;
       setStatus('检测到文档页面变化，开始记录新页面阅读进度。');
     }
     state.readingPageSignature = signature;
@@ -1951,6 +1987,7 @@
     state.currentVideo = null;
     state.readingStartedAt = Date.now();
     state.readingCompleted = false;
+    state.documentReadyForCoursewareNext = false;
     if (state.notesInput) {
       state.notesInput.value = getNotes();
     }
