@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.3.6
+// @version      0.3.7
 // @description  Save real learning progress, confirm reader page turns, and stay inside courseware menus.
 // @author       qwdcvj
 // @homepageURL  https://github.com/qwdcvj/mooc-self-study
@@ -1815,20 +1815,31 @@
 
     const percent = getReadingPercent();
     const dwellSeconds = Math.floor((Date.now() - state.readingStartedAt) / 1000);
+    const pageState = !hasVideo && inCoursewarePage ? getDocumentPageState() : null;
 
     if (!hasVideo &&
         inCoursewarePage &&
         !state.readingCompleted &&
         dwellSeconds >= CONFIG.documentPageDwellSeconds) {
       state.readingCompleted = true;
-      saveJson('readingComplete', {
-        title: getPageTitle(),
-        percent,
-        dwellSeconds,
-        completedAt: new Date().toISOString(),
-        url: location.href
-      });
-      setStatus(`当前文档页已停留 ${CONFIG.documentPageDwellSeconds} 秒，准备翻页或进入课件下一项。`);
+
+      if (canStillTurnDocumentPage(pageState)) {
+        setStatus(`当前文档第 ${pageState.current}/${pageState.total} 页已停留 ${CONFIG.documentPageDwellSeconds} 秒，准备翻到下一页。`);
+      } else if (isKnownLastDocumentPage(pageState)) {
+        saveJson('readingComplete', {
+          title: getPageTitle(),
+          percent,
+          dwellSeconds,
+          page: pageState.current,
+          totalPages: pageState.total,
+          completedAt: new Date().toISOString(),
+          url: location.href
+        });
+        setStatus(`文档最后一页 ${pageState.current}/${pageState.total} 已停留 ${CONFIG.documentPageDwellSeconds} 秒，准备确认文档完成。`);
+      } else {
+        setStatus(`当前文档页已停留 ${CONFIG.documentPageDwellSeconds} 秒，尝试查找下一页；未确认最后一页前不会切换课件。`);
+      }
+
       clickNextControlAfterCompletion('reading', null);
     }
 
@@ -1836,6 +1847,8 @@
       title: getPageTitle(),
       percent,
       dwellSeconds,
+      page: pageState ? pageState.current : null,
+      totalPages: pageState ? pageState.total : null,
       savedAt: new Date().toISOString(),
       url: location.href
     });
