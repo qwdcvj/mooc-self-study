@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.3.5
+// @version      0.3.6
 // @description  Save real learning progress, confirm reader page turns, and stay inside courseware menus.
 // @author       qwdcvj
 // @homepageURL  https://github.com/qwdcvj/mooc-self-study
@@ -641,6 +641,151 @@
 
   function findNextCoursewareContentControl() {
     return findNextVisibleCoursewareContentControl(getCurrentCoursewareLabel());
+  }
+
+  function getCurrentSubsectionKey() {
+    const labels = [
+      getCurrentCoursewareLabel(),
+      getPageTitle(),
+      ...Array.from(document.querySelectorAll('button,a,[role="button"],[role="tab"],[onclick]'))
+        .filter(isVisible)
+        .filter(isActiveLessonControl)
+        .map(getElementLabel)
+    ];
+
+    for (const label of labels) {
+      const match = cleanText(label).match(/(\d+\.\d+)/);
+      if (match) return match[1];
+    }
+
+    return cleanText(getCurrentCoursewareLabel() || getPageTitle()).slice(0, 80);
+  }
+
+  function classifySectionContentType(label) {
+    const text = cleanText(label);
+    if (/视频|录像|video/i.test(text)) return 'video';
+    if (/文档|资料|课件|讲义|阅读|pdf|ppt|document|doc/i.test(text)) return 'document';
+    return null;
+  }
+
+  function getSectionContentCompletionMap() {
+    return loadJson('sectionContentCompletion', {});
+  }
+
+  function saveSectionContentCompletionMap(value) {
+    saveJson('sectionContentCompletion', value);
+  }
+
+  function getCurrentSectionCompletion() {
+    const key = getCurrentSubsectionKey();
+    const all = getSectionContentCompletionMap();
+    return key ? (all[key] || {}) : {};
+  }
+
+  function markCurrentSectionContentComplete(type) {
+    if (!type) return;
+    const key = getCurrentSubsectionKey();
+    if (!key) return;
+
+    const all = getSectionContentCompletionMap();
+    all[key] = {
+      ...(all[key] || {}),
+      [type]: true,
+      updatedAt: new Date().toISOString()
+    };
+    saveSectionContentCompletionMap(all);
+    log('Marked section content complete:', key, type, all[key]);
+  }
+
+  function getSectionContentControls() {
+    const subsectionKey = getCurrentSubsectionKey();
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[role="tab"]',
+      '[onclick]',
+      'li',
+      '[class*="tab"]',
+      '[class*="item"]',
+      '[class*="lesson"]',
+      '[class*="section"]',
+      '[class*="unit"]'
+    ];
+    const viewportHeight = window.innerHeight || document.documentElement.clientHeight || 800;
+    const seen = new Set();
+
+    return Array.from(document.querySelectorAll(selectors.join(',')))
+      .map((element) => getClickableElement(element))
+      .filter((element) => {
+        if (!element || seen.has(element) || !isVisible(element) || isDisabled(element) || isNonCourseControl(element)) {
+          return false;
+        }
+        seen.add(element);
+        const rect = element.getBoundingClientRect();
+        return rect.top >= 0 && rect.top <= viewportHeight * 0.55 && rect.height <= 96;
+      })
+      .map((element) => {
+        const label = getElementLabel(element);
+        const type = classifySectionContentType(label);
+        return type ? { element, label: cleanText(label), type } : null;
+      })
+      .filter(Boolean)
+      .filter((item) => !subsectionKey || item.label.includes(subsectionKey) || hasDottedContentNumber(item.label))
+      .filter((item, index, list) => list.findIndex((other) => other.element === item.element || other.type === item.type && other.label === item.label) === index);
+  }
+
+  function getRequiredCurrentSectionContentTypes() {
+    const types = new Set(getSectionContentControls().map((item) => item.type));
+    if (!types.size) {
+      if (document.querySelector('video')) types.add('video');
+      if (!document.querySelector('video')) types.add('document');
+    }
+    return Array.from(types);
+  }
+
+  function findNextIncompleteCurrentSectionContentControl() {
+    const completion = getCurrentSectionCompletion();
+    const controls = getSectionContentControls();
+    const orderedTypes = ['video', 'document'];
+
+    for (const type of orderedTypes) {
+      if (completion[type]) continue;
+      const control = controls.find((item) => item.type === type && !isActiveLessonControl(item.element));
+      if (control) return control;
+    }
+
+    return null;
+  }
+
+  function isCurrentSectionRequiredContentComplete() {
+    const requiredTypes = getRequiredCurrentSectionContentTypes();
+    const completion = getCurrentSectionCompletion();
+    return requiredTypes.every((type) => completion[type]);
+  }
+
+  function switchToPendingSectionContentIfNeeded(completedType) {
+    markCurrentSectionContentComplete(completedType);
+
+    const pending = findNextIncompleteCurrentSectionContentControl();
+    if (pending) {
+      setStatus(`当前小节的${completedType === 'video' ? '视频' : '文档'}已完成，切换到未完成的${pending.type === 'video' ? '视频' : '文档'}：${pending.label}`);
+      clickElementLikeMouse(pending.element);
+      state.pendingClick = false;
+      state.readingStartedAt = Date.now();
+      state.readingCompleted = false;
+      state.documentReadyForCoursewareNext = false;
+      return true;
+    }
+
+    if (!isCurrentSectionRequiredContentComplete()) {
+      setStatus('当前小节还有课件内容未完成，暂不进入下一小节。');
+      state.pendingClick = false;
+      state.documentReadyForCoursewareNext = false;
+      return true;
+    }
+
+    return false;
   }
 
   function hasExpandedCurrentSubsectionMenu() {
@@ -1351,6 +1496,7 @@
       }
 
       if (reason === 'reading' && !nextPageControl && isKnownLastDocumentPage(currentPageState) && attempt < 4) {
+        markCurrentSectionContentComplete('document');
         state.documentReadyForCoursewareNext = true;
         setStatus(`已到文档最后一页（${currentPageState.current}/${currentPageState.total}），正在回到顶部查找下一个课件小项。`);
         scrollToCoursewareNavigation();
@@ -1375,8 +1521,11 @@
 
       nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
       const allowCoursewareNext = reason !== 'reading' || state.documentReadyForCoursewareNext;
+      const canAdvanceCourseware = (reason === 'reading' || reason === 'video') && allowCoursewareNext && !nextPageControl;
 
-      if (reason === 'reading' && allowCoursewareNext && !nextPageControl && attempt === 4) {
+      if (canAdvanceCourseware && attempt === 4) {
+        if (reason === 'reading' && switchToPendingSectionContentIfNeeded('document')) return;
+
         const visibleCoursewareControl = findNextCoursewareContentControl();
         if (visibleCoursewareControl) {
           state.completedContentKeys.add(completionKey);
@@ -1394,13 +1543,11 @@
         }
       }
 
-      const nextCoursewareControl = reason === 'reading' && allowCoursewareNext && !nextPageControl && attempt >= 5
+      const nextCoursewareControl = canAdvanceCourseware && attempt >= 5
         ? findNextCoursewareContentControl()
         : null;
 
-      if (reason === 'reading' &&
-          allowCoursewareNext &&
-          !nextPageControl &&
+      if (canAdvanceCourseware &&
           !nextCoursewareControl &&
           attempt === 5 &&
           !hasExpandedCurrentSubsectionMenu() &&
@@ -1410,19 +1557,19 @@
         return;
       }
 
-      if (reason === 'reading' && allowCoursewareNext && !nextPageControl && !nextCoursewareControl && attempt >= 5 && attempt < 6 && openChapterMenu()) {
+      if (canAdvanceCourseware && !nextCoursewareControl && attempt >= 5 && attempt < 6 && openChapterMenu()) {
         window.setTimeout(() => tryClick(6, pageTurnRetries), CONFIG.coursewareMenuOpenDelayMs);
         return;
       }
 
-      const nextChapterControl = reason === 'reading' && allowCoursewareNext && !nextPageControl && !nextCoursewareControl && attempt >= 6
+      const nextChapterControl = canAdvanceCourseware && !nextCoursewareControl && attempt >= 6
         ? findNextChapterControl()
         : null;
 
       const nextControl = nextPageControl ||
         nextCoursewareControl ||
         nextChapterControl ||
-        (reason === 'reading' ? null : findNextControl());
+        (reason === 'reading' || reason === 'video' ? null : findNextControl());
       if (nextControl) {
         if (nextPageControl) {
           const beforePageState = getDocumentPageState();
@@ -1469,6 +1616,7 @@
               return;
             }
 
+            markCurrentSectionContentComplete('document');
             state.documentReadyForCoursewareNext = true;
             setStatus(`已到文档最后一页（${lastPageState.current}/${lastPageState.total}），正在回到顶部课件菜单查找下一项。`);
             scrollToCoursewareNavigation();
@@ -1506,6 +1654,16 @@
       setStatus(`已完成当前${getCompletionLabel(reason)}，但没有在课件章节内容里找到下一项。`);
       state.pendingClick = false;
     };
+
+    if (reason === 'video') {
+      if (video) state.completedVideos.add(video);
+      if (switchToPendingSectionContentIfNeeded('video')) return;
+      state.documentReadyForCoursewareNext = true;
+      setStatus('当前小节的视频和文档已完成，准备进入下一小节。');
+      scrollToCoursewareNavigation();
+      window.setTimeout(() => tryClick(4, 0), CONFIG.clickDelayMs);
+      return;
+    }
 
     window.setTimeout(() => tryClick(1), CONFIG.clickDelayMs);
   }
