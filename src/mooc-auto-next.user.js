@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.3.8
+// @version      0.3.9
 // @description  Save real learning progress, confirm reader page turns, and stay inside courseware menus.
 // @author       qwdcvj
 // @homepageURL  https://github.com/qwdcvj/mooc-self-study
@@ -988,7 +988,7 @@
   }
 
   function parsePageIndicator(label) {
-    const match = cleanText(label).match(/(?:^|\s)(\d{1,3})\s*\/\s*(\d{1,3})(?:\s|$)/);
+    const match = cleanText(label).match(/(?:^|[^\d])(\d{1,3})\s*[\/／]\s*(\d{1,3})(?!\d)/);
     if (!match) return null;
     const current = Number(match[1]);
     const total = Number(match[2]);
@@ -1063,18 +1063,8 @@
             element: item.element,
             rect: item.rect,
             current: explicit.current,
-            total: explicit.total
-          };
-        }
-
-        const numbers = (label.match(/\d{1,3}/g) || []).map(Number);
-        const total = numbers.find((value) => value > item.current);
-        if (total && total <= 300) {
-          return {
-            element: item.element,
-            rect: item.rect,
-            current: item.current,
-            total
+            total: explicit.total,
+            source: 'explicit'
           };
         }
       }
@@ -1325,7 +1315,7 @@
   }
 
   function isKnownLastDocumentPage(pageState) {
-    return Boolean(pageState && pageState.current && pageState.total && pageState.current >= pageState.total);
+    return Boolean(pageState && pageState.current && pageState.total && pageState.current === pageState.total);
   }
 
   function clickElementLikeMouse(element, pointerOptions = {}) {
