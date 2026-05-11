@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.3.4
+// @version      0.3.5
 // @description  Save real learning progress, confirm reader page turns, and stay inside courseware menus.
 // @author       qwdcvj
 // @homepageURL  https://github.com/qwdcvj/mooc-self-study
@@ -339,6 +339,14 @@
     return Math.abs(centerX - referenceCenterX) <= tolerance;
   }
 
+  function sortByScreenPosition(elements) {
+    return elements.slice().sort((left, right) => {
+      const leftRect = left.getBoundingClientRect();
+      const rightRect = right.getBoundingClientRect();
+      return leftRect.top - rightRect.top || leftRect.left - rightRect.left;
+    });
+  }
+
   function parseChineseNumber(value) {
     const text = cleanText(value);
     if (/^\d+$/.test(text)) return Number(text);
@@ -561,7 +569,8 @@
         return !order || compareContentOrder(order, referenceOrder) === 0;
       });
 
-    return candidates.find(isActiveLessonControl) || candidates[0] || null;
+    const orderedCandidates = sortByScreenPosition(candidates);
+    return orderedCandidates[0] || null;
   }
 
   function getCurrentChapterLabel() {
@@ -608,7 +617,8 @@
         return !order || compareContentOrder(order, referenceOrder) === 0;
       });
 
-    return candidates.find(isActiveLessonControl) || candidates[0] || null;
+    const orderedCandidates = sortByScreenPosition(candidates);
+    return orderedCandidates[0] || null;
   }
 
   function openCoursewareMenuForCurrentContent() {
@@ -631,6 +641,22 @@
 
   function findNextCoursewareContentControl() {
     return findNextVisibleCoursewareContentControl(getCurrentCoursewareLabel());
+  }
+
+  function hasExpandedCurrentSubsectionMenu() {
+    const referenceOrder = getContentOrder(getCurrentCoursewareLabel());
+    if (!referenceOrder || referenceOrder.length < 2) return false;
+
+    const toggle = findCoursewareMenuToggle();
+    const uniqueOrders = new Set(
+      getCoursewareContentCandidates(document.body)
+        .filter((item) => hasDottedContentNumber(item.label))
+        .filter((item) => item.order[0] === referenceOrder[0])
+        .filter((item) => !toggle || sameControl(item.element, toggle) || isNearElementColumn(item.element, toggle))
+        .map((item) => item.order.slice(0, 2).join('.'))
+    );
+
+    return uniqueOrders.size > 1;
   }
 
   function findNextChapterControl() {
@@ -1349,23 +1375,49 @@
 
       nextPageControl = reason === 'reading' ? findNextDocumentPageControl() : null;
       const allowCoursewareNext = reason !== 'reading' || state.documentReadyForCoursewareNext;
-      const nextCoursewareControl = reason === 'reading' && allowCoursewareNext && !nextPageControl && attempt >= 4
+
+      if (reason === 'reading' && allowCoursewareNext && !nextPageControl && attempt === 4) {
+        const visibleCoursewareControl = findNextCoursewareContentControl();
+        if (visibleCoursewareControl) {
+          state.completedContentKeys.add(completionKey);
+          state.documentReadyForCoursewareNext = false;
+          setStatus(`当前文档已到最后一页，进入右侧小节菜单的下一项：${getElementLabel(visibleCoursewareControl) || '下一项'}`);
+          log('Clicking next subsection after final document page:', getElementLabel(visibleCoursewareControl));
+          clickElementLikeMouse(visibleCoursewareControl);
+          state.pendingClick = false;
+          return;
+        }
+
+        if (openCoursewareMenuForCurrentContent()) {
+          window.setTimeout(() => tryClick(5, pageTurnRetries), CONFIG.coursewareMenuOpenDelayMs);
+          return;
+        }
+      }
+
+      const nextCoursewareControl = reason === 'reading' && allowCoursewareNext && !nextPageControl && attempt >= 5
         ? findNextCoursewareContentControl()
         : null;
 
-      if (reason === 'reading' && allowCoursewareNext && !nextPageControl && !nextCoursewareControl && attempt === 4 && openCoursewareMenuForCurrentContent()) {
-        window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), CONFIG.coursewareMenuOpenDelayMs);
+      if (reason === 'reading' &&
+          allowCoursewareNext &&
+          !nextPageControl &&
+          !nextCoursewareControl &&
+          attempt === 5 &&
+          !hasExpandedCurrentSubsectionMenu() &&
+          openCoursewareMenuForCurrentContent()) {
+        setStatus('还没有看到右侧小节菜单展开，先再次点击右侧小节按钮。');
+        window.setTimeout(() => tryClick(5.5, pageTurnRetries), CONFIG.coursewareMenuOpenDelayMs);
         return;
       }
 
-      const nextChapterControl = reason === 'reading' && allowCoursewareNext && !nextPageControl && !nextCoursewareControl && attempt >= 5
+      if (reason === 'reading' && allowCoursewareNext && !nextPageControl && !nextCoursewareControl && attempt >= 5 && attempt < 6 && openChapterMenu()) {
+        window.setTimeout(() => tryClick(6, pageTurnRetries), CONFIG.coursewareMenuOpenDelayMs);
+        return;
+      }
+
+      const nextChapterControl = reason === 'reading' && allowCoursewareNext && !nextPageControl && !nextCoursewareControl && attempt >= 6
         ? findNextChapterControl()
         : null;
-
-      if (reason === 'reading' && allowCoursewareNext && !nextPageControl && !nextCoursewareControl && !nextChapterControl && attempt === 5 && openChapterMenu()) {
-        window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), CONFIG.coursewareMenuOpenDelayMs);
-        return;
-      }
 
       const nextControl = nextPageControl ||
         nextCoursewareControl ||
@@ -1446,7 +1498,7 @@
         return;
       }
 
-      if (attempt < 6) {
+      if (attempt < 7) {
         window.setTimeout(() => tryClick(attempt + 1, pageTurnRetries), 1000);
         return;
       }
