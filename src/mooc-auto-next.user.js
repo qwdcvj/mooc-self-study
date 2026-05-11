@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.3.7
+// @version      0.3.8
 // @description  Save real learning progress, confirm reader page turns, and stay inside courseware menus.
 // @author       qwdcvj
 // @homepageURL  https://github.com/qwdcvj/mooc-self-study
@@ -1003,6 +1003,9 @@
   }
 
   function findDocumentPageIndicator() {
+    const splitIndicator = findSplitDocumentPageIndicator();
+    if (splitIndicator) return splitIndicator;
+
     const selectors = [
       'button',
       'a',
@@ -1022,8 +1025,7 @@
         return page ? { element, rect: element.getBoundingClientRect(), ...page } : null;
       })
       .filter(Boolean)
-      .sort((left, right) => right.rect.top - left.rect.top || left.rect.width - right.rect.width)[0] ||
-      findSplitDocumentPageIndicator();
+      .sort((left, right) => right.rect.top - left.rect.top || left.rect.width - right.rect.width)[0] || null;
   }
 
   function findSplitDocumentPageIndicator() {
@@ -1058,8 +1060,8 @@
         const explicit = parsePageIndicator(label);
         if (explicit && explicit.current === item.current) {
           return {
-            element: container,
-            rect: container.getBoundingClientRect(),
+            element: item.element,
+            rect: item.rect,
             current: explicit.current,
             total: explicit.total
           };
@@ -1084,7 +1086,8 @@
   function findNextReaderArrowControl(pageInfo) {
     if (!pageInfo) return null;
 
-    const indicatorCenterY = pageInfo.rect.top + pageInfo.rect.height / 2;
+    const referenceRect = findCurrentPageNumberRect(pageInfo) || pageInfo.rect;
+    const indicatorCenterY = referenceRect.top + referenceRect.height / 2;
     const selectors = [
       'button',
       'a',
@@ -1107,10 +1110,11 @@
 
         const rect = element.getBoundingClientRect();
         const label = cleanText(getElementLabel(element));
+        if (/[\/／]/.test(label)) return false;
         const classAndId = getClassAndIdChain(element, 3);
         const centerY = rect.top + rect.height / 2;
-        const isRightOfIndicator = rect.left >= pageInfo.rect.right - 4 &&
-          rect.left - pageInfo.rect.right <= 140 &&
+        const isRightOfIndicator = rect.left >= referenceRect.right - 4 &&
+          rect.left - referenceRect.right <= 180 &&
           Math.abs(centerY - indicatorCenterY) <= 48;
         const looksLikeArrow = /^(>|›|»|→|▶|▸|▹)$/.test(label) ||
           /下一页|下页|后一页|下一张/.test(label) ||
@@ -1128,13 +1132,102 @@
       })[0] || null;
   }
 
+  function findCurrentPageNumberRect(pageInfo) {
+    if (!pageInfo || !pageInfo.current) return null;
+
+    const currentText = String(pageInfo.current);
+    const centerY = pageInfo.rect.top + pageInfo.rect.height / 2;
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[onclick]',
+      'span',
+      'i',
+      'em',
+      'div'
+    ];
+
+    const candidates = Array.from(document.querySelectorAll(selectors.join(',')))
+      .filter(isVisible)
+      .filter(isInDocumentPagerArea)
+      .map((element) => ({
+        element,
+        rect: element.getBoundingClientRect(),
+        label: cleanText(getElementLabel(element))
+      }))
+      .filter((item) => item.label === currentText)
+      .filter((item) => item.rect.width <= 80 && item.rect.height <= 56)
+      .filter((item) => Math.abs((item.rect.top + item.rect.height / 2) - centerY) <= 80)
+      .sort((left, right) => {
+        const leftActive = isActiveLessonControl(left.element) ? 0 : 1;
+        const rightActive = isActiveLessonControl(right.element) ? 0 : 1;
+        return leftActive - rightActive ||
+          Math.abs(left.rect.left - pageInfo.rect.left) - Math.abs(right.rect.left - pageInfo.rect.left);
+      });
+
+    return candidates[0] ? candidates[0].rect : null;
+  }
+
+  function findNextReaderArrowByGeometry(pageInfo) {
+    if (!pageInfo) return null;
+
+    const referenceRect = findCurrentPageNumberRect(pageInfo) || pageInfo.rect;
+    const centerY = referenceRect.top + referenceRect.height / 2;
+    const selectors = [
+      'button',
+      'a',
+      '[role="button"]',
+      '[onclick]',
+      'span',
+      'i',
+      'em',
+      'div'
+    ];
+
+    const seen = new Set();
+    const candidates = Array.from(document.querySelectorAll(selectors.join(',')))
+      .filter(isVisible)
+      .filter(isInDocumentPagerArea)
+      .map((element) => getClickableAncestor(element))
+      .filter((element) => {
+        if (!element || seen.has(element) || isDisabled(element) || sameControl(element, pageInfo.element)) return false;
+        seen.add(element);
+
+        const rect = element.getBoundingClientRect();
+        const label = cleanText(getElementLabel(element));
+        const classAndId = getClassAndIdChain(element, 3);
+        if (/^\d{1,3}$/.test(label) || /[\/／]/.test(label) || parsePageIndicator(label)) return false;
+        if (rect.width > 80 || rect.height > 64) return false;
+
+        const elementCenterY = rect.top + rect.height / 2;
+        const distanceRight = rect.left - referenceRect.right;
+        const interactive = element.matches('button,a,[role="button"],[onclick]') ||
+          /next|right|arrow|pager|page|btn|j-|u-/i.test(classAndId) ||
+          /^(>|›|»|→|▶|▸|▹)$/.test(label) ||
+          label === '';
+        return distanceRight >= -2 &&
+          distanceRight <= 180 &&
+          Math.abs(elementCenterY - centerY) <= 42 &&
+          interactive;
+      })
+      .map((element) => ({
+        element,
+        rect: element.getBoundingClientRect()
+      }))
+      .sort((left, right) => left.rect.left - right.rect.left);
+
+    return candidates[0] ? candidates[0].element : null;
+  }
+
   function findNextReaderArrowByPoint(pageInfo) {
     if (!pageInfo || !document.elementFromPoint) return null;
 
-    const centerY = pageInfo.rect.top + pageInfo.rect.height / 2;
-    const offsets = [18, 28, 42, 60, 84, 112];
+    const referenceRect = findCurrentPageNumberRect(pageInfo) || pageInfo.rect;
+    const centerY = referenceRect.top + referenceRect.height / 2;
+    const offsets = [28, 42, 58, 74, 92, 116, 148];
     for (const offset of offsets) {
-      const x = Math.min(window.innerWidth - 2, pageInfo.rect.right + offset);
+      const x = Math.min(window.innerWidth - 2, referenceRect.right + offset);
       const y = Math.min(window.innerHeight - 2, Math.max(2, centerY));
       const target = document.elementFromPoint(x, y);
       const clickable = getClickableAncestor(target);
@@ -1143,7 +1236,7 @@
       }
 
       const label = cleanText(getElementLabel(clickable));
-      if (parsePageIndicator(label) || /^\d{1,3}$/.test(label)) continue;
+      if (parsePageIndicator(label) || /^\d{1,3}$/.test(label) || /[\/／]/.test(label)) continue;
       if (!isInDocumentPagerArea(clickable)) continue;
       return clickable;
     }
@@ -1204,7 +1297,8 @@
     const pageInfo = findDocumentPageIndicator();
     if (!pageInfo) return null;
     if (isKnownLastDocumentPage(pageInfo)) return null;
-    return findNextReaderArrowControl(pageInfo) ||
+    return findNextReaderArrowByGeometry(pageInfo) ||
+      findNextReaderArrowControl(pageInfo) ||
       findNextReaderArrowByPoint(pageInfo) ||
       findNextReaderThumbnailControl(pageInfo);
   }
@@ -1489,7 +1583,7 @@
           return;
         }
 
-        setStatus(`文档还没翻完（${currentPageState.current}/${currentPageState.total}），但没有找到可点击的下一页按钮，已停止切换课件。`);
+        setStatus(`文档还没翻完（${currentPageState.current}/${currentPageState.total}），但没有点到右侧翻页按钮，已停止切换课件。`);
         state.readingCompleted = false;
         state.pendingClick = false;
         return;
