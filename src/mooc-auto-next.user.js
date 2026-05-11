@@ -1,9 +1,12 @@
 // ==UserScript==
 // @name         MOOC Study Assistant
 // @namespace    https://github.com/qwdcvj/mooc-self-study
-// @version      0.3.2
+// @version      0.3.3
 // @description  Save real learning progress, confirm reader page turns, and stay inside courseware menus.
 // @author       qwdcvj
+// @homepageURL  https://github.com/qwdcvj/mooc-self-study
+// @downloadURL  https://raw.githubusercontent.com/qwdcvj/mooc-self-study/codex/study-assistant/src/mooc-auto-next.user.js
+// @updateURL    https://raw.githubusercontent.com/qwdcvj/mooc-self-study/codex/study-assistant/src/mooc-auto-next.user.js
 // @match        *://icourse163.org/*
 // @match        *://*.icourse163.org/*
 // @match        *://imooc.com/*
